@@ -41,7 +41,10 @@ pub struct Declaration {
     pub end_byte: usize,
     pub node_kind: String,
     pub signature: String,
-    pub structural_hashes: HashSet<u64>,
+    /// Sorted and deduplicated. Both consumers (MinHash, intersection count) are
+    /// order-independent, and sequential u64s intersect far faster than a hash set
+    /// whose RandomState re-hashes values that are already uniformly distributed.
+    pub structural_hashes: Vec<u64>,
     pub size: usize,
     pub minhash_signature: Vec<u64>,
     pub fingerprint: Option<FunctionFingerprint>,
@@ -73,7 +76,9 @@ impl From<&Declaration> for SerializableDeclaration {
             start_byte: decl.start_byte,
             end_byte: decl.end_byte,
             signature: decl.signature.clone(),
-            structural_hashes: decl.structural_hashes.clone(),
+            // Converted here rather than changing the field type: the dump is a
+            // bincode format on disk and existing dumps must stay loadable.
+            structural_hashes: decl.structural_hashes.iter().copied().collect(),
             size: decl.size,
             minhash_signature: decl.minhash_signature.clone(),
             fingerprint: decl.fingerprint.clone(),
@@ -90,7 +95,7 @@ pub struct DeclarationData {
     line: usize,
     end_line: usize,
     signature: String,
-    structural_hashes: HashSet<u64>,
+    structural_hashes: Vec<u64>,
     size: usize,
     minhash_signature: Vec<u64>,
     fingerprint: Option<FunctionFingerprint>,
@@ -163,6 +168,31 @@ fn apply_kind_penalty(similarity: f64, kind1: &DeclarationKind, kind2: &Declarat
         | (DeclarationKind::Variable, DeclarationKind::Function)
     );
     similarity * if is_func_var_swap { 0.9 } else { 0.7 }
+}
+
+/// Number of values present in both sorted, deduplicated slices.
+///
+/// A straight merge rather than galloping: the only caller has already rejected any pair
+/// whose size ratio is below 0.3, so the two sides are never skewed enough for binary
+/// search to beat two sequential scans.
+fn sorted_intersection_count(a: &[u64], b: &[u64]) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    let mut j = 0;
+
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                count += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+
+    count
 }
 
 /// Classification of a matched declaration pair based on normalized diff.
@@ -413,7 +443,7 @@ impl StructuralDiff {
 
     fn create_declaration(&self, name: String, kind: DeclarationKind,
                          line: usize, end_line: usize, start_byte: usize, end_byte: usize,
-                         node_kind: &str, signature: String, structural_hashes: HashSet<u64>,
+                         node_kind: &str, signature: String, structural_hashes: Vec<u64>,
                          fingerprint: Option<FunctionFingerprint>) -> Declaration {
         let size = structural_hashes.len();
 
@@ -488,7 +518,7 @@ impl StructuralDiff {
                                 let structural_hashes = if let Some(value_node) = child.child_by_field_name("value") {
                                     self.collect_structural_hashes(value_node, source)
                                 } else {
-                                    HashSet::new()
+                                    Vec::new()
                                 };
                                 declarations.push(self.create_declaration(
                                     name.to_string(), kind,
@@ -559,10 +589,16 @@ impl StructuralDiff {
         }
     }
     
-    fn collect_structural_hashes(&self, node: Node, source: &str) -> HashSet<u64> {
-        let mut hashes = HashSet::new();
+    fn collect_structural_hashes(&self, node: Node, source: &str) -> Vec<u64> {
+        let mut hashes = Vec::new();
         let mut scratch = Vec::new();
         self.collect_structural_hashes_recursive(node, source, &mut hashes, &mut scratch);
+
+        // Dedup here is not an optimization: `size` and the Jaccard denominator are
+        // both set cardinalities, so the vector has to carry each hash once.
+        hashes.sort_unstable();
+        hashes.dedup();
+
         hashes
     }
 
@@ -575,7 +611,7 @@ impl StructuralDiff {
     /// `scratch` is a shared stack of child hashes: each frame owns the slice from `base` onwards
     /// and truncates back to it before returning, so the whole traversal shares one allocation
     /// instead of allocating a `Vec` per internal node.
-    fn collect_structural_hashes_recursive(&self, node: Node, source: &str, hashes: &mut HashSet<u64>,
+    fn collect_structural_hashes_recursive(&self, node: Node, source: &str, hashes: &mut Vec<u64>,
                                            scratch: &mut Vec<u64>) -> u64 {
         use std::collections::hash_map::DefaultHasher;
 
@@ -628,7 +664,7 @@ impl StructuralDiff {
         scratch.truncate(base);
 
         let hash = hasher.finish();
-        hashes.insert(hash);
+        hashes.push(hash);
 
         hash
     }
@@ -716,7 +752,7 @@ impl StructuralDiff {
         }
     }
     
-    fn compute_minhash(&self, hashes: &HashSet<u64>, num_hashes: usize) -> Vec<u64> {
+    fn compute_minhash(&self, hashes: &[u64], num_hashes: usize) -> Vec<u64> {
         use std::collections::hash_map::DefaultHasher;
 
         let mut signature = vec![u64::MAX; num_hashes];
@@ -1250,7 +1286,7 @@ impl StructuralDiff {
         // surviving candidate pair (50M+ on a large bundle), and collecting sets
         // just to read .len() off them was the single hottest allocation in the
         // tool. |A u B| = |A| + |B| - |A n B| makes the union free.
-        let intersection = decl1.structural_hashes.intersection(&decl2.structural_hashes).count();
+        let intersection = sorted_intersection_count(&decl1.structural_hashes, &decl2.structural_hashes);
         let union = size1 + size2 - intersection;
         let base_similarity = intersection as f64 / union as f64;
 
