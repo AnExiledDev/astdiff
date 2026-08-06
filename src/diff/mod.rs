@@ -599,6 +599,10 @@ impl StructuralDiff {
         hashes.sort_unstable();
         hashes.dedup();
 
+        // Structural hashes repeat heavily, so dedup frees most of the vector. Without this
+        // every declaration would hold its pre-dedup capacity for the rest of the run.
+        hashes.shrink_to_fit();
+
         hashes
     }
 
