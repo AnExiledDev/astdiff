@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use anyhow::Result;
-use tree_sitter::{Node, Tree};
+use tree_sitter::Node;
 use serde::{Serialize, Deserialize};
 
 pub mod fingerprint;
@@ -10,6 +10,17 @@ pub mod parallel_matching_v2;
 pub mod profiling;
 
 use fingerprint::*;
+
+/// Number of MinHash lanes per declaration. These values feed Jaccard estimation and the
+/// LSH banding gate, so changing this changes which declarations match.
+const MINHASH_LANES: usize = 128;
+
+/// Read once: this is checked per declaration during extraction, and env::var takes the
+/// process env lock and allocates on every call.
+fn debug_enabled() -> bool {
+    static DEBUG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG_ENABLED.get_or_init(|| std::env::var("ASTDIFF_DEBUG").is_ok())
+}
 
 /// Represents a structural diff between two JavaScript ASTs
 pub struct StructuralDiff {
@@ -97,6 +108,23 @@ impl Declaration {
             size: self.size,
             minhash_signature: self.minhash_signature.clone(),
             fingerprint: self.fingerprint.clone(),
+        }
+    }
+
+    /// Same fields as `to_data`, but moved. On a large bundle the cloned copy of
+    /// every structural hash set doubles peak memory for the whole matching phase,
+    /// so any caller that owns its declarations should convert this way.
+    fn into_data(self) -> DeclarationData {
+        DeclarationData {
+            name: self.name,
+            kind: self.kind,
+            line: self.line,
+            end_line: self.end_line,
+            signature: self.signature,
+            structural_hashes: self.structural_hashes,
+            size: self.size,
+            minhash_signature: self.minhash_signature,
+            fingerprint: self.fingerprint,
         }
     }
 }
@@ -273,24 +301,14 @@ impl StructuralDiff {
     }
     
     
-    pub fn compare(&self, source1: &str, source2: &str, 
-                  tree1: &Tree, tree2: &Tree,
+    /// Takes declarations rather than trees so the caller can drop each syntax tree
+    /// as soon as its declarations are extracted; nothing below here reads a Node.
+    pub fn compare(&self, source1: &str, source2: &str,
+                  declarations1: Vec<Declaration>, declarations2: Vec<Declaration>,
                   dump: Option<&std::path::Path>,
                   file1_path: &std::path::Path, file2_path: &std::path::Path) -> Result<DiffResult> {
-        use profiling::Timer;
         use crate::dump::{AstDiffDump, DiffConfig};
-        
-        // Extract declarations
-        let declarations1 = {
-            let _timer = Timer::new("extract_declarations_file1");
-            self.extract_declarations(tree1.root_node(), source1)
-        };
-        
-        let declarations2 = {
-            let _timer = Timer::new("extract_declarations_file2");
-            self.extract_declarations(tree2.root_node(), source2)
-        };
-        
+
         // Compare declarations
         let need_dump = dump.is_some();
         let declarations1_clone = if need_dump { Some(declarations1.clone()) } else { None };
@@ -349,15 +367,16 @@ impl StructuralDiff {
         eprintln!("Extracted {} declarations from file1, {} from file2",
                  declarations1.len(), declarations2.len());
 
+        let total_declarations1 = declarations1.len();
+        let total_declarations2 = declarations2.len();
+
         // Match declarations — now returns rename map and pre-classified changes
         let (matches, changes, rename_map) = {
             let _timer = Timer::new("match_declarations_total");
-            self.match_declarations(&declarations1, &declarations2, source1, source2)
+            self.match_owned_declarations(declarations1, declarations2, source1, source2)
         };
 
         let matched_declarations = matches.len();
-        let total_declarations1 = declarations1.len();
-        let total_declarations2 = declarations2.len();
 
         let similarity = if total_declarations1 == 0 && total_declarations2 == 0 {
             1.0
@@ -376,18 +395,31 @@ impl StructuralDiff {
         })
     }
 
-    fn extract_declarations<'a>(&self, root: Node<'a>, source: &str) -> Vec<Declaration> {
+    pub fn extract_declarations<'a>(&self, root: Node<'a>, source: &str) -> Vec<Declaration> {
+        use rayon::prelude::*;
+
         let mut declarations = Vec::new();
         self.extract_declarations_recursive(root, source, &mut declarations, true);
+
+        // Each signature depends only on its own declaration's hash set, so this pass is
+        // order-independent. It runs here rather than in create_declaration because the
+        // recursive walk holds tree-sitter Nodes and cannot cross threads.
+        declarations.par_iter_mut().for_each(|decl| {
+            decl.minhash_signature = self.compute_minhash(&decl.structural_hashes, MINHASH_LANES);
+        });
+
         declarations
     }
-    
+
     fn create_declaration(&self, name: String, kind: DeclarationKind,
                          line: usize, end_line: usize, start_byte: usize, end_byte: usize,
                          node_kind: &str, signature: String, structural_hashes: HashSet<u64>,
                          fingerprint: Option<FunctionFingerprint>) -> Declaration {
         let size = structural_hashes.len();
-        let minhash_signature = self.compute_minhash(&structural_hashes, 128);
+
+        // Left empty on purpose: extract_declarations fills every signature in one
+        // parallel pass once the whole vector exists.
+        let minhash_signature = Vec::new();
 
         Declaration {
             name,
@@ -413,7 +445,7 @@ impl StructuralDiff {
         let extractor = FingerprintExtractor::new(source);
         let fp = extractor.extract_function_fingerprint(node);
 
-        if std::env::var("ASTDIFF_DEBUG").is_ok() && !fp.strings.is_empty() {
+        if debug_enabled() && !fp.strings.is_empty() {
             eprintln!("Fingerprint for {} '{}': {} strings, {} constants, {} API calls",
                 kind, name, fp.strings.len(), fp.constants.len(), fp.api_calls.len());
             for s in &fp.strings {
@@ -680,27 +712,28 @@ impl StructuralDiff {
     }
     
     fn compute_minhash(&self, hashes: &HashSet<u64>, num_hashes: usize) -> Vec<u64> {
+        use std::collections::hash_map::DefaultHasher;
+
         let mut signature = vec![u64::MAX; num_hashes];
-        
+
         for &hash in hashes {
+            // The seeded hash is `value` then `seed` written into a fresh DefaultHasher,
+            // so the state after writing the value is a prefix shared by all num_hashes
+            // seeds. Cloning it feeds the hasher exactly the same byte sequence per seed
+            // while paying for the value write once instead of num_hashes times.
+            let mut base = DefaultHasher::new();
+            hash.hash(&mut base);
+
             for i in 0..num_hashes {
-                let hash_value = self.hash_with_seed_u64(hash, i);
-                signature[i] = signature[i].min(hash_value);
+                let mut hasher = base.clone();
+                i.hash(&mut hasher);
+                signature[i] = signature[i].min(hasher.finish());
             }
         }
-        
+
         signature
     }
-    
-    fn hash_with_seed_u64(&self, value: u64, seed: usize) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        let mut hasher = DefaultHasher::new();
-        value.hash(&mut hasher);
-        seed.hash(&mut hasher);
-        hasher.finish()
-    }
-    
-    
+
     pub fn calculate_declaration_similarity(&self, decl1: &Declaration, decl2: &Declaration, _source1: &str, _source2: &str) -> f64 {
         // Delegate to the _data version via conversion
         let d1 = decl1.to_data();
@@ -1115,10 +1148,11 @@ impl StructuralDiff {
     
     pub fn match_declarations(&self, decls1: &[Declaration], decls2: &[Declaration], source1: &str, source2: &str)
         -> (Vec<(usize, usize)>, Vec<Change>, HashMap<String, String>) {
-        use parallel_matching_v2::ParallelMatcherV2;
         use profiling::Timer;
 
         eprintln!("Using parallel matching v2 for {} x {} declarations", decls1.len(), decls2.len());
+
+        let scorer = self.build_rarity_scorer(decls1.iter().chain(decls2.iter()));
 
         // Convert to thread-safe data structures
         let data1: Vec<DeclarationData> = {
@@ -1127,19 +1161,51 @@ impl StructuralDiff {
         };
         let data2: Vec<DeclarationData> = decls2.iter().map(|d| d.to_data()).collect();
 
-        // Build rarity scorer if using fingerprints
-        let scorer = if self.use_fingerprints {
-            let _timer = Timer::new("build_rarity_scorer_parallel");
-            let mut scorer = RarityScorer::new();
-            for decl in decls1.iter().chain(decls2.iter()) {
-                if let Some(ref fp) = decl.fingerprint {
-                    scorer.add_fingerprint(fp);
-                }
-            }
-            Some(scorer)
-        } else {
-            None
+        self.run_matcher(data1, data2, source1, source2, scorer)
+    }
+
+    /// Consuming counterpart of `match_declarations`: each declaration's hash set and
+    /// fingerprint are moved into its `DeclarationData`, so the source vectors free as
+    /// they are converted instead of living alongside a full clone.
+    fn match_owned_declarations(&self, decls1: Vec<Declaration>, decls2: Vec<Declaration>, source1: &str, source2: &str)
+        -> (Vec<(usize, usize)>, Vec<Change>, HashMap<String, String>) {
+        use profiling::Timer;
+
+        eprintln!("Using parallel matching v2 for {} x {} declarations", decls1.len(), decls2.len());
+
+        let scorer = self.build_rarity_scorer(decls1.iter().chain(decls2.iter()));
+
+        let data1: Vec<DeclarationData> = {
+            let _timer = Timer::new("convert_to_data_structures");
+            decls1.into_iter().map(|d| d.into_data()).collect()
         };
+        let data2: Vec<DeclarationData> = decls2.into_iter().map(|d| d.into_data()).collect();
+
+        self.run_matcher(data1, data2, source1, source2, scorer)
+    }
+
+    fn build_rarity_scorer<'a>(&self, decls: impl Iterator<Item = &'a Declaration>) -> Option<RarityScorer> {
+        use profiling::Timer;
+
+        if !self.use_fingerprints {
+            return None;
+        }
+
+        let _timer = Timer::new("build_rarity_scorer_parallel");
+        let mut scorer = RarityScorer::new();
+        for decl in decls {
+            if let Some(ref fp) = decl.fingerprint {
+                scorer.add_fingerprint(fp);
+            }
+        }
+
+        Some(scorer)
+    }
+
+    fn run_matcher(&self, data1: Vec<DeclarationData>, data2: Vec<DeclarationData>,
+                   source1: &str, source2: &str, scorer: Option<RarityScorer>)
+        -> (Vec<(usize, usize)>, Vec<Change>, HashMap<String, String>) {
+        use parallel_matching_v2::ParallelMatcherV2;
 
         let matcher = ParallelMatcherV2::new(self.use_fingerprints);
 
@@ -1152,7 +1218,7 @@ impl StructuralDiff {
             |d1, d2, s1, s2| self.calculate_declaration_similarity_data(d1, d2, s1, s2),
         )
     }
-    
+
     fn calculate_declaration_similarity_data(&self, decl1: &DeclarationData, decl2: &DeclarationData, _source1: &str, _source2: &str) -> f64 {
         // For imports and exports, use signature similarity regardless of kind
         if matches!(decl1.kind, DeclarationKind::Import | DeclarationKind::Export)

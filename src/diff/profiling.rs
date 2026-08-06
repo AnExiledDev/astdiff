@@ -4,6 +4,11 @@ use std::sync::Mutex;
 
 lazy_static::lazy_static! {
     static ref PROFILER: Mutex<Profiler> = Mutex::new(Profiler::new());
+
+    /// Read once: Timer::new runs per declaration, and env::var takes the process env
+    /// lock and allocates on every call. Setting the variable mid-run no longer has any
+    /// effect, which nothing relies on.
+    static ref PROFILE_ENABLED: bool = std::env::var("ASTDIFF_PROFILE").is_ok();
 }
 
 pub struct Profiler {
@@ -57,7 +62,7 @@ impl Profiler {
 }
 
 pub fn start_timer(name: &str) {
-    if std::env::var("ASTDIFF_PROFILE").is_ok() {
+    if *PROFILE_ENABLED {
         if let Ok(mut profiler) = PROFILER.lock() {
             profiler.start(name);
         }
@@ -65,7 +70,7 @@ pub fn start_timer(name: &str) {
 }
 
 pub fn stop_timer(name: &str) {
-    if std::env::var("ASTDIFF_PROFILE").is_ok() {
+    if *PROFILE_ENABLED {
         if let Ok(mut profiler) = PROFILER.lock() {
             profiler.stop(name);
         }
@@ -73,7 +78,7 @@ pub fn stop_timer(name: &str) {
 }
 
 pub fn report_profile() {
-    if std::env::var("ASTDIFF_PROFILE").is_ok() {
+    if *PROFILE_ENABLED {
         if let Ok(profiler) = PROFILER.lock() {
             profiler.report();
         }
@@ -87,7 +92,7 @@ pub struct Timer<'a> {
 
 impl<'a> Timer<'a> {
     pub fn new(name: &'a str) -> Self {
-        let enabled = std::env::var("ASTDIFF_PROFILE").is_ok();
+        let enabled = *PROFILE_ENABLED;
         if enabled {
             start_timer(name);
         }
