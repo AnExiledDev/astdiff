@@ -10,7 +10,6 @@ pub mod parallel_matching_v2;
 pub mod profiling;
 
 use fingerprint::*;
-use matching_report::*;
 
 /// Represents a structural diff between two JavaScript ASTs
 pub struct StructuralDiff {
@@ -1151,7 +1150,6 @@ impl StructuralDiff {
             source2,
             scorer.as_ref(),
             |d1, d2, s1, s2| self.calculate_declaration_similarity_data(d1, d2, s1, s2),
-            |d1, d2, fp1, fp2, s| self.create_evidence_breakdown_data(d1, d2, fp1, fp2, s),
         )
     }
     
@@ -1186,132 +1184,5 @@ impl StructuralDiff {
         let base_similarity = intersection as f64 / union as f64;
 
         apply_kind_penalty(base_similarity, &decl1.kind, &decl2.kind)
-    }
-    
-    fn create_evidence_breakdown_data(&self, decl1: &DeclarationData, decl2: &DeclarationData, 
-                                     fp1: &FunctionFingerprint, fp2: &FunctionFingerprint, 
-                                     scorer: &RarityScorer) -> EvidenceBreakdown {
-        let mut string_matches = Vec::new();
-        let mut constant_matches = Vec::new();
-        let mut api_matches = Vec::new();
-        
-        // Match strings
-        for s1 in &fp1.strings {
-            for s2 in &fp2.strings {
-                if s1.value == s2.value {
-                    let rarity = scorer.score_string(&s1.value);
-                    let context_weight = match s1.context {
-                        StringContext::ErrorMessage => 1.2,
-                        StringContext::FilePath => 1.1,
-                        StringContext::CommandName => 1.0,
-                        StringContext::ConfigKey => 0.9,
-                        StringContext::ApiEndpoint => 1.0,
-                        StringContext::Regular => 0.7,
-                    };
-                    string_matches.push(StringMatch {
-                        value: s1.value.clone(),
-                        context: format!("{:?}", s1.context),
-                        rarity_score: rarity,
-                        contribution: rarity * context_weight,
-                    });
-                    break;
-                }
-            }
-        }
-        
-        // Match constants
-        for c1 in &fp1.constants {
-            for c2 in &fp2.constants {
-                if c1.value == c2.value {
-                    let rarity = scorer.score_constant(&c1.value);
-                    constant_matches.push(ConstantMatch {
-                        value: format!("{:?}", c1.value),
-                        type_: match &c1.value {
-                            ConstantValue::Number(_) => "number",
-                            ConstantValue::Float(_) => "float",
-                            ConstantValue::Regex(_) => "regex",
-                            ConstantValue::Duration(_) => "duration",
-                        }.to_string(),
-                        rarity_score: rarity,
-                        contribution: rarity * 0.8,
-                    });
-                    break;
-                }
-            }
-        }
-        
-        // Match API calls
-        for api1 in &fp1.api_calls {
-            for api2 in &fp2.api_calls {
-                if api1.object == api2.object && api1.method == api2.method {
-                    let rarity = scorer.score_api_call(api1);
-                    api_matches.push(ApiMatch {
-                        call: format!("{}.{}", 
-                            api1.object.as_deref().unwrap_or("global"), 
-                            api1.method),
-                        first_arg: api1.first_arg.clone(),
-                        rarity_score: rarity,
-                        contribution: rarity * 0.6,
-                    });
-                    break;
-                }
-            }
-        }
-        
-        // Calculate unique elements
-        let unique_strings1: Vec<_> = fp1.strings.iter()
-            .filter(|s| !fp2.strings.iter().any(|s2| s2.value == s.value))
-            .map(|s| (s.value.clone(), format!("{:?}", s.context)))
-            .collect();
-            
-        let unique_strings2: Vec<_> = fp2.strings.iter()
-            .filter(|s| !fp1.strings.iter().any(|s1| s1.value == s.value))
-            .map(|s| (s.value.clone(), format!("{:?}", s.context)))
-            .collect();
-        
-        let unique_to_func1 = UniqueElements {
-            strings: unique_strings1,
-            constants: Vec::new(), // TODO: implement
-            api_calls: Vec::new(), // TODO: implement
-        };
-        
-        let unique_to_func2 = UniqueElements {
-            strings: unique_strings2,
-            constants: Vec::new(), // TODO: implement
-            api_calls: Vec::new(), // TODO: implement
-        };
-        
-        // Size analysis
-        let size_ratio = decl2.size as f64 / decl1.size as f64;
-        let interpretation = if size_ratio > 1.2 {
-            "likely enhanced"
-        } else if size_ratio < 0.8 {
-            "significantly reduced"
-        } else {
-            "similar size"
-        }.to_string();
-        
-        let total_score = string_matches.iter().map(|s| s.contribution).sum::<f64>()
-            + constant_matches.iter().map(|c| c.contribution).sum::<f64>()
-            + api_matches.iter().map(|a| a.contribution).sum::<f64>();
-            
-        let evidence_count = string_matches.len() + constant_matches.len() + api_matches.len();
-        
-        EvidenceBreakdown {
-            total_score,
-            evidence_count,
-            string_matches,
-            constant_matches,
-            api_matches,
-            unique_to_func1,
-            unique_to_func2,
-            size_analysis: SizeAnalysis {
-                size1: decl1.size,
-                size2: decl2.size,
-                ratio: size_ratio,
-                size_penalty: if size_ratio < 0.7 { 0.2 } else { 0.0 },
-                interpretation,
-            },
-        }
     }
 }

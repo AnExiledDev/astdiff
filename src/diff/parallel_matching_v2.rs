@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use super::{DeclarationData, DeclarationKind, Change, ChangeType, DiffClassification};
-use super::fingerprint::{self, FunctionFingerprint, calculate_fingerprint_similarity, RarityScorer};
-use super::matching_report::EvidenceBreakdown;
+use super::fingerprint::{self, calculate_fingerprint_similarity, RarityScorer};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -26,7 +25,6 @@ pub struct SimilarityResult {
     pub i2: usize,
     pub similarity: f64,
     pub evidence_count: usize,
-    pub evidence_breakdown: Option<EvidenceBreakdown>,
     pub name_match: bool,  // True if names match exactly
 }
 
@@ -51,7 +49,6 @@ impl ParallelMatcherV2 {
         source2: &str,
         scorer: Option<&RarityScorer>,
         calculate_similarity: impl Fn(&DeclarationData, &DeclarationData, &str, &str) -> f64 + Sync,
-        create_evidence: impl Fn(&DeclarationData, &DeclarationData, &FunctionFingerprint, &FunctionFingerprint, &RarityScorer) -> EvidenceBreakdown + Sync,
     ) -> (Vec<(usize, usize)>, Vec<Change>, HashMap<String, String>) {
         use super::profiling::Timer;
 
@@ -75,7 +72,6 @@ impl ParallelMatcherV2 {
                 source2,
                 scorer,
                 &calculate_similarity,
-                &create_evidence,
             )
         };
 
@@ -195,7 +191,6 @@ impl ParallelMatcherV2 {
         source2: &str,
         scorer: Option<&RarityScorer>,
         calculate_similarity: &(impl Fn(&DeclarationData, &DeclarationData, &str, &str) -> f64 + Sync),
-        create_evidence: &(impl Fn(&DeclarationData, &DeclarationData, &FunctionFingerprint, &FunctionFingerprint, &RarityScorer) -> EvidenceBreakdown + Sync),
     ) -> Vec<SimilarityResult> {
         let progress = AtomicUsize::new(0);
         let total = candidates.len();
@@ -209,22 +204,38 @@ impl ParallelMatcherV2 {
                     let decl1 = &decls1[candidate.i1 as usize];
                     let decl2 = &decls2[candidate.i2 as usize];
                     
-                    let (similarity, evidence_count, evidence_breakdown) = 
+                    let (similarity, evidence_count) =
                         if self.use_fingerprints {
-                            if let (Some(ref fp1), Some(ref fp2), Some(s)) = 
+                            if let (Some(ref fp1), Some(ref fp2), Some(s)) =
                                 (&decl1.fingerprint, &decl2.fingerprint, scorer) {
                                 let (fp_score, ev_count) = calculate_fingerprint_similarity(fp1, fp2, s);
-                                let breakdown = create_evidence(decl1, decl2, fp1, fp2, s);
+
+                                // The structural term can only lower the combined score, so a
+                                // pair whose best case already misses the threshold cannot
+                                // survive and does not need its structural similarity computed.
+                                // The bound is written as the real expression with struct_sim
+                                // pinned at its maximum, so it is bit-identical to what the
+                                // pair would have scored, and this skips exactly the pairs the
+                                // threshold below would have rejected.
+                                //
+                                // Name matches are exempt: they are kept regardless of score,
+                                // and their similarity value decides their place in the sort.
+                                let best_case = fp_score * 0.7 + 1.0 * 0.3;
+                                if !candidate.name_match
+                                    && !should_match_with_score(best_case, ev_count, decl1.size)
+                                {
+                                    continue;
+                                }
+
                                 let struct_sim = calculate_similarity(decl1, decl2, source1, source2);
-                                let combined = fp_score * 0.7 + struct_sim * 0.3;
-                                (combined, ev_count, Some(breakdown))
+                                (fp_score * 0.7 + struct_sim * 0.3, ev_count)
                             } else {
-                                (calculate_similarity(decl1, decl2, source1, source2), 0, None)
+                                (calculate_similarity(decl1, decl2, source1, source2), 0)
                             }
                         } else {
-                            (calculate_similarity(decl1, decl2, source1, source2), 0, None)
+                            (calculate_similarity(decl1, decl2, source1, source2), 0)
                         };
-                    
+
                     // Apply thresholds - always include name matches
                     if candidate.name_match || should_match_with_score(similarity, evidence_count, decl1.size) {
                         results.push(SimilarityResult {
@@ -232,7 +243,6 @@ impl ParallelMatcherV2 {
                             i2: candidate.i2 as usize,
                             similarity,
                             evidence_count,
-                            evidence_breakdown,
                             name_match: candidate.name_match,
                         });
                     }
