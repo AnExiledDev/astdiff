@@ -7,11 +7,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Instant, Duration};
 
+/// A pair that survived LSH filtering.
+///
+/// Indices are u32 because this list is the largest live allocation in the tool
+/// (50M+ entries on a 34 MB bundle) and no input has come close to 4 billion
+/// declarations. The old struct also carried the LSH score, which nothing ever
+/// read; dropping it and narrowing the indices takes the entry from 32 to 12 bytes.
 #[derive(Debug, Clone)]
 pub struct CandidateMatch {
-    pub i1: usize,
-    pub i2: usize,
-    pub lsh_similarity: f64,
+    pub i1: u32,
+    pub i2: u32,
     pub name_match: bool,  // True if names match exactly
 }
 
@@ -50,18 +55,11 @@ impl ParallelMatcherV2 {
     ) -> (Vec<(usize, usize)>, Vec<Change>, HashMap<String, String>) {
         use super::profiling::Timer;
 
-        // Step 1: Build all potential pairs with size filtering
-        let pairs = {
-            let _timer = Timer::new("build_candidate_pairs");
-            self.build_candidate_pairs(decls1, decls2)
-        };
-
-        eprintln!("Built {} candidate pairs to check", pairs.len());
-
-        // Step 2: Parallel LSH filtering
+        // Steps 1+2: generate candidate pairs and LSH-filter them in one pass, so
+        // only survivors are ever stored (see build_and_filter_candidates).
         let lsh_candidates = {
-            let _timer = Timer::new("parallel_lsh_filter");
-            self.parallel_lsh_filter(&pairs, decls1, decls2)
+            let _timer = Timer::new("build_and_filter_candidates");
+            self.build_and_filter_candidates(decls1, decls2)
         };
 
         eprintln!("LSH filtering reduced to {} candidates", lsh_candidates.len());
@@ -90,7 +88,23 @@ impl ParallelMatcherV2 {
         (matches, changes, rename_map)
     }
     
-    fn build_candidate_pairs(&self, decls1: &[DeclarationData], decls2: &[DeclarationData]) -> Vec<(usize, usize)> {
+    /// Generate the candidate pairs and LSH-filter them in a single pass.
+    ///
+    /// This used to be two steps: materialize every (i1, i2) pair whose sizes and
+    /// kinds were compatible, then filter that list down. On a 34 MB bundle the
+    /// intermediate list held 230 million pairs, 3.7 GB, and it stayed alive while
+    /// the filtered list was built next to it. Worse, a Vec that large grows by
+    /// doubling, so the last reallocation needs the old and new buffers resident at
+    /// the same time. That transient spike is what aborted the process on hosts
+    /// where the memory was not there.
+    ///
+    /// Testing each pair as it is generated means only the survivors are ever
+    /// stored, which is roughly a fifth of the pairs on real input.
+    ///
+    /// Output order is unchanged (i1 ascending, then decls2 in size order):
+    /// resolve_best_matches sorts these by similarity with a stable sort, so the
+    /// order here decides tie-breaks and therefore the final diff.
+    fn build_and_filter_candidates(&self, decls1: &[DeclarationData], decls2: &[DeclarationData]) -> Vec<CandidateMatch> {
         // Sort declarations by size for efficient window search
         let mut sorted2: Vec<(usize, usize)> = decls2.iter()
             .enumerate()
@@ -98,53 +112,41 @@ impl ParallelMatcherV2 {
             .collect();
         sorted2.sort_by_key(|(_, size)| *size);
 
-        let mut pairs = Vec::with_capacity(decls1.len() * 100); // Estimate ~100 candidates per declaration
-
-        for (i1, decl1) in decls1.iter().enumerate() {
-            let min_size = ((decl1.size as f64) * 0.5).max(1.0) as usize;
-            let max_size = ((decl1.size as f64) * 1.5) as usize;
-
-            // Binary search for window start
-            let start_idx = sorted2.partition_point(|(_, size)| *size < min_size);
-
-            // Add all pairs within size window and matching kind
-            for idx in start_idx..sorted2.len() {
-                let (i2, size2) = sorted2[idx];
-                if size2 > max_size {
-                    break;
-                }
-
-                if decl1.kind == decls2[i2].kind {
-                    pairs.push((i1, i2));
-                }
-            }
-        }
-
-        pairs
-    }
-    
-    fn parallel_lsh_filter(&self, pairs: &[(usize, usize)], decls1: &[DeclarationData], decls2: &[DeclarationData]) -> Vec<CandidateMatch> {
-        let progress = AtomicUsize::new(0);
-        let total = pairs.len();
+        let examined = AtomicUsize::new(0);
         let last_update = Mutex::new(Instant::now());
 
-        // Process in parallel batches
-        let results = pairs.par_chunks(self.batch_size)
-            .flat_map(|batch| {
-                let mut local_results = Vec::with_capacity(batch.len() / 3); // Estimate 1/3 will pass
+        let results: Vec<CandidateMatch> = decls1.par_iter()
+            .enumerate()
+            .flat_map_iter(|(i1, decl1)| {
+                let min_size = ((decl1.size as f64) * 0.5).max(1.0) as usize;
+                let max_size = ((decl1.size as f64) * 1.5) as usize;
 
-                for &(i1, i2) in batch {
-                    let decl1 = &decls1[i1];
+                // Binary search for window start
+                let start_idx = sorted2.partition_point(|(_, size)| *size < min_size);
+
+                let mut local_results = Vec::new();
+                let mut local_examined = 0usize;
+
+                for idx in start_idx..sorted2.len() {
+                    let (i2, size2) = sorted2[idx];
+                    if size2 > max_size {
+                        break;
+                    }
+
                     let decl2 = &decls2[i2];
+                    if decl1.kind != decl2.kind {
+                        continue;
+                    }
+
+                    local_examined += 1;
 
                     // Always include pairs with matching names - they're almost certainly
                     // the same function/variable and need to be compared for string diffs
                     // even if structural similarity is low (e.g., template string content changed)
                     if decl1.name == decl2.name {
                         local_results.push(CandidateMatch {
-                            i1,
-                            i2,
-                            lsh_similarity: 1.0, // Treat as high similarity for matching priority
+                            i1: i1 as u32,
+                            i2: i2 as u32,
                             name_match: true,
                         });
                         continue;
@@ -157,31 +159,30 @@ impl ParallelMatcherV2 {
 
                     if lsh_sim >= 0.3 {
                         local_results.push(CandidateMatch {
-                            i1,
-                            i2,
-                            lsh_similarity: lsh_sim,
+                            i1: i1 as u32,
+                            i2: i2 as u32,
                             name_match: false,
                         });
                     }
                 }
-                
+
                 // Report progress every second
-                let done = progress.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
-                
+                let done = examined.fetch_add(local_examined, Ordering::Relaxed) + local_examined;
+
                 if let Ok(mut last) = last_update.try_lock() {
-                    if last.elapsed() >= Duration::from_secs(1) || done == total {
-                        eprint!("\r  LSH filtering: {}/{} ({:.1}%)", done, total, done as f64 / total as f64 * 100.0);
+                    if last.elapsed() >= Duration::from_secs(1) {
+                        eprint!("\r  LSH filtering: {} pairs examined", done);
                         *last = Instant::now();
                     }
                 }
-                
-                local_results
+
+                local_results.into_iter()
             })
             .collect();
-            
+
         // Clear the progress line with a final update
-        eprintln!("\r  LSH filtering: {}/{} (100.0%) - Complete", total, total);
-        
+        eprintln!("\r  LSH filtering: {} pairs examined - Complete", examined.load(Ordering::Relaxed));
+
         results
     }
     
@@ -205,8 +206,8 @@ impl ParallelMatcherV2 {
                 let mut results = Vec::with_capacity(batch.len());
                 
                 for candidate in batch {
-                    let decl1 = &decls1[candidate.i1];
-                    let decl2 = &decls2[candidate.i2];
+                    let decl1 = &decls1[candidate.i1 as usize];
+                    let decl2 = &decls2[candidate.i2 as usize];
                     
                     let (similarity, evidence_count, evidence_breakdown) = 
                         if self.use_fingerprints {
@@ -227,8 +228,8 @@ impl ParallelMatcherV2 {
                     // Apply thresholds - always include name matches
                     if candidate.name_match || should_match_with_score(similarity, evidence_count, decl1.size) {
                         results.push(SimilarityResult {
-                            i1: candidate.i1,
-                            i2: candidate.i2,
+                            i1: candidate.i1 as usize,
+                            i2: candidate.i2 as usize,
                             similarity,
                             evidence_count,
                             evidence_breakdown,
