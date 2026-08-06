@@ -146,30 +146,50 @@ fn run_diff(
     use crate::diff::StructuralDiff;
     use crate::diff::profiling::Timer;
     
+    use crate::diff::Declaration;
     use std::thread;
-    
-    // Load and parse both files in parallel
+
+    // Must happen before extraction starts, which now reads the flag off the worker threads
+    if verbose {
+        std::env::set_var("ASTDIFF_DEBUG", "1");
+    }
+
+    // Load, parse and extract both files in parallel. Extraction happens inside the worker
+    // so each syntax tree (hundreds of MB on a large bundle) is dropped at thread exit;
+    // Declaration owns all of its data and nothing downstream reads a Node.
     let file1_path = file1.clone();
-    let handle1 = thread::spawn(move || -> Result<(String, tree_sitter::Tree)> {
-        let _timer = Timer::new("read_and_parse_file1");
+    let handle1 = thread::spawn(move || -> Result<(String, Vec<Declaration>)> {
+        let parse_timer = Timer::new("read_and_parse_file1");
         let source = fs::read_to_string(&file1_path)?;
         let mut parser = JsParser::new()?;
         let tree = parser.parse(&source)?;
-        Ok((source, tree))
+        drop(parse_timer);
+
+        let declarations = {
+            let _timer = Timer::new("extract_declarations_file1");
+            StructuralDiff::new().extract_declarations(tree.root_node(), &source)
+        };
+        Ok((source, declarations))
     });
-    
+
     let file2_path = file2.clone();
-    let handle2 = thread::spawn(move || -> Result<(String, tree_sitter::Tree)> {
-        let _timer = Timer::new("read_and_parse_file2");
+    let handle2 = thread::spawn(move || -> Result<(String, Vec<Declaration>)> {
+        let parse_timer = Timer::new("read_and_parse_file2");
         let source = fs::read_to_string(&file2_path)?;
         let mut parser = JsParser::new()?;
         let tree = parser.parse(&source)?;
-        Ok((source, tree))
+        drop(parse_timer);
+
+        let declarations = {
+            let _timer = Timer::new("extract_declarations_file2");
+            StructuralDiff::new().extract_declarations(tree.root_node(), &source)
+        };
+        Ok((source, declarations))
     });
-    
-    let (source1, tree1) = handle1.join().expect("Thread 1 panicked")?;
-    let (source2, tree2) = handle2.join().expect("Thread 2 panicked")?;
-    
+
+    let (source1, declarations1) = handle1.join().expect("Thread 1 panicked")?;
+    let (source2, declarations2) = handle2.join().expect("Thread 2 panicked")?;
+
     eprintln!("Source files: {} bytes, {} bytes", source1.len(), source2.len());
     
     let mut diff = StructuralDiff::new();
@@ -180,10 +200,7 @@ fn run_diff(
     if let Some(path) = report_path {
         diff.set_report_path(path);
     }
-    if verbose {
-        std::env::set_var("ASTDIFF_DEBUG", "1");
-    }
-    
+
     // Load mappings if provided
     if let Some(map_path) = map1 {
         let mapping_content = fs::read_to_string(&map_path)?;
@@ -198,8 +215,8 @@ fn run_diff(
     
     let result = {
         let _timer = Timer::new("diff_compare_total");
-        diff.compare(&source1, &source2, 
-                    &tree1, &tree2, 
+        diff.compare(&source1, &source2,
+                    declarations1, declarations2,
                     dump.as_deref(),
                     &file1, &file2)?
     };
