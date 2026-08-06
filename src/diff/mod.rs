@@ -1176,10 +1176,14 @@ impl StructuralDiff {
             return 0.2;
         }
 
-        // Jaccard similarity from structural hash intersection
-        let intersection: HashSet<_> = decl1.structural_hashes.intersection(&decl2.structural_hashes).cloned().collect();
-        let union: HashSet<_> = decl1.structural_hashes.union(&decl2.structural_hashes).cloned().collect();
-        let base_similarity = intersection.len() as f64 / union.len() as f64;
+        // Jaccard similarity from structural hash intersection.
+        // Count directly instead of materializing the two sets: this runs once per
+        // surviving candidate pair (50M+ on a large bundle), and collecting sets
+        // just to read .len() off them was the single hottest allocation in the
+        // tool. |A u B| = |A| + |B| - |A n B| makes the union free.
+        let intersection = decl1.structural_hashes.intersection(&decl2.structural_hashes).count();
+        let union = size1 + size2 - intersection;
+        let base_similarity = intersection as f64 / union as f64;
 
         apply_kind_penalty(base_similarity, &decl1.kind, &decl2.kind)
     }
