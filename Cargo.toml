@@ -35,3 +35,7 @@ similar = "2.4"
 [dev-dependencies]
 tempfile = "3.10"
 pretty_assertions = "1.4"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
