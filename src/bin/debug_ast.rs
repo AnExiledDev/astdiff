@@ -52,13 +52,17 @@ fn print_tree(node: Node, source: &str, indent: usize) {
 }
 
 fn main() {
-    let source = r#"import * as WbB from "path";"#;
+    let source = match std::env::args().nth(1) {
+        Some(path) => std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e)),
+        None => r#"import * as WbB from "path";"#.to_string(),
+    };
     println!("Source: {}", source);
     println!("---");
 
     let mut parser = Parser::new();
     parser.set_language(tree_sitter_javascript::language()).unwrap();
-    
-    let tree = parser.parse(source, None).unwrap();
-    print_tree(tree.root_node(), source, 0);
+
+    let tree = parser.parse(&source, None).unwrap();
+    print_tree(tree.root_node(), &source, 0);
 }
