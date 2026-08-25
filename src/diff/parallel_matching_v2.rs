@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use super::{DeclarationData, DeclarationKind, Change, ChangeType, DiffClassification, MINHASH_LANES};
+use super::alpha;
 use super::fingerprint::{self, calculate_fingerprint_similarity, RarityScorer};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -427,6 +428,7 @@ impl ParallelMatcherV2 {
         let mut unchanged_count = 0usize;
         let mut string_only_count = 0usize;
         let mut structural_count = 0usize;
+        let mut tokenizer = alpha::AlphaTokenizer::new();
 
         for &(i1, i2, similarity) in &match_data {
             let decl1 = &decls1[i1];
@@ -455,46 +457,63 @@ impl ParallelMatcherV2 {
                 continue;
             }
 
-            // Normalize pipeline (order matters — keywords must survive for stripping):
-            // 1. Comparison normalization on RAW source (canonicalize imports, strip
-            //    var/let/const, strip trailing punct, collapse whitespace)
-            // 2. Apply rename map to pre-normalized source2
-            // 3. Blank minified identifiers on both
             let is_import = matches!(decl1.kind, DeclarationKind::Import);
-            let pre_s1 = fingerprint::normalize_for_comparison(&src1, is_import);
-            let pre_s2 = fingerprint::normalize_for_comparison(&src2, is_import);
 
-            let (comp_s1, comp_s2) = if !rename_map.is_empty() {
-                let renamed = fingerprint::normalize_string_with_renames(&pre_s2, &rename_map);
-                (
-                    fingerprint::normalize_minified_identifiers(&pre_s1),
-                    fingerprint::normalize_minified_identifiers(&renamed),
-                )
+            let (classification, display_diff) = if is_import {
+                // Imports keep the string-normalization path: import canonicalization
+                // collapses multiline import lists, which token comparison would
+                // misread as churn.
+                let pre_s1 = fingerprint::normalize_for_comparison(&src1, true);
+                let pre_s2 = fingerprint::normalize_for_comparison(&src2, true);
+
+                let renamed = if rename_map.is_empty() {
+                    pre_s2
+                } else {
+                    fingerprint::normalize_string_with_renames(&pre_s2, &rename_map)
+                };
+                let comp_s1 = fingerprint::normalize_minified_identifiers(&pre_s1);
+                let comp_s2 = fingerprint::normalize_minified_identifiers(&renamed);
+
+                if comp_s1 == comp_s2 {
+                    (DiffClassification::Unchanged, String::new())
+                } else {
+                    let display_diff = StructuralDiff::generate_normalized_display_diff(
+                        &src1, &src2, &comp_s1, &comp_s2, 3,
+                    );
+
+                    if display_diff.is_empty() {
+                        (DiffClassification::Unchanged, String::new())
+                    } else {
+                        (fingerprint::classify_diff_lines(&display_diff), display_diff)
+                    }
+                }
             } else {
-                (
-                    fingerprint::normalize_minified_identifiers(&pre_s1),
-                    fingerprint::normalize_minified_identifiers(&pre_s2),
-                )
+                // Token-level alpha-equivalence: a consistent rename (top-level or
+                // function-local, any identifier length) compares equal, and masking
+                // string content separates string-only edits from structural ones.
+                let t1 = tokenizer.tokenize(&src1);
+                let t2 = tokenizer.tokenize(&src2);
+
+                if alpha::alpha_equal(&t1, &t2) {
+                    (DiffClassification::Unchanged, String::new())
+                } else {
+                    let classification = if alpha::alpha_equal_masked(&t1, &t2) {
+                        DiffClassification::StringOnly
+                    } else {
+                        DiffClassification::Structural
+                    };
+                    let display_diff = StructuralDiff::generate_alpha_display_diff(
+                        &src1, &src2, &t1.norm_lines(), &t2.norm_lines(), 3,
+                    );
+
+                    (classification, display_diff)
+                }
             };
 
-            // Compare with aggressive normalization
-            if comp_s1 == comp_s2 {
+            if matches!(classification, DiffClassification::Unchanged) {
                 unchanged_count += 1;
                 continue;
             }
-
-            // Generate display diff using comparison normalization for LCS alignment
-            let display_diff = StructuralDiff::generate_normalized_display_diff(
-                &src1, &src2, &comp_s1, &comp_s2, 3,
-            );
-
-            if display_diff.is_empty() {
-                unchanged_count += 1;
-                continue;
-            }
-
-            // Classify: string-only vs structural
-            let classification = fingerprint::classify_diff_lines(&display_diff);
 
             let desc = if decl1.name != decl2.name {
                 match classification {
