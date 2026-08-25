@@ -6,12 +6,13 @@
 //! identifiers replaced by their first-occurrence index (`%0`, `%1`, ...).
 //!
 //! What is normalized and what is kept literal:
-//! - `identifier` and `statement_identifier` (labels) are indexed: minifiers
-//!   rename both freely, and a consistent rename maps to the same index
-//!   sequence on both sides.
-//! - Property names (`property_identifier`, `private_property_identifier`,
-//!   shorthand object keys) stay literal: minifiers do not rename property
-//!   accesses, and `a.push` vs `a.shift` must never compare equal.
+//! - `identifier`, `statement_identifier` (labels) and
+//!   `private_property_identifier` (`#x` class fields, which are class-scoped)
+//!   are indexed: minifiers rename all three freely, and a consistent rename
+//!   maps to the same index sequence on both sides.
+//! - Public property names (`property_identifier`, shorthand object keys) stay
+//!   literal: minifiers do not rename property accesses, and `a.push` vs
+//!   `a.shift` must never compare equal.
 //! - String fragments and escape sequences become [`NormTok::Str`], compared
 //!   by content normally and ignored by the masked comparison, so "only
 //!   string text changed" is detectable at the token level.
@@ -165,7 +166,7 @@ fn push_leaf(
     let text = &src[node.byte_range()];
 
     let tok = match kind {
-        "identifier" | "statement_identifier" => {
+        "identifier" | "statement_identifier" | "private_property_identifier" => {
             let next_id = var_ids.len() as u32;
             NormTok::Var(*var_ids.entry(text.to_string()).or_insert(next_id))
         }
@@ -256,6 +257,13 @@ mod tests {
     fn label_rename_is_equal() {
         let a = toks("e: { if (x) break e; run(x); }");
         let b = toks("f: { if (y) break f; run(y); }");
+        assert!(alpha_equal(&a, &b));
+    }
+
+    #[test]
+    fn private_field_rename_is_equal() {
+        let a = toks("class A { #o = 1; get() { return this.#o; } }");
+        let b = toks("class B { #i = 1; get() { return this.#i; } }");
         assert!(alpha_equal(&a, &b));
     }
 
