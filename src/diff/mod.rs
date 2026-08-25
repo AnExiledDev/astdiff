@@ -4,6 +4,7 @@ use anyhow::Result;
 use tree_sitter::Node;
 use serde::{Serialize, Deserialize};
 
+pub mod alpha;
 pub mod fingerprint;
 pub mod matching_report;
 pub mod parallel_matching_v2;
@@ -788,9 +789,14 @@ impl StructuralDiff {
     
     
     
+    /// Leaf kinds hashed by their raw text. `template_string` is deliberately absent:
+    /// hashing a whole template raw leaks every `${ident}` into the hash, so a pure
+    /// rename changed the template's hash and, transitively, every ancestor's along the
+    /// spine, gutting Jaccard similarity for template-heavy functions. Hashing only the
+    /// static `string_fragment` pieces keeps templates text-sensitive but rename-invariant.
     fn is_literal(&self, node: Node) -> bool {
-        matches!(node.kind(), 
-            "string" | "number" | "true" | "false" | "null" | "undefined" | "regex" | "template_string"
+        matches!(node.kind(),
+            "string" | "number" | "true" | "false" | "null" | "undefined" | "regex" | "string_fragment"
         )
     }
     
@@ -942,6 +948,50 @@ impl StructuralDiff {
                 if !orig_line.ends_with('\n') {
                     output.push('\n');
                 }
+            }
+        }
+
+        if has_changes { output } else { String::new() }
+    }
+
+    /// Like [`StructuralDiff::generate_normalized_display_diff`], but aligns on
+    /// precomputed alpha-normalized line slices and renders context lines from the NEW
+    /// side, so every emitted line is verbatim from exactly one file: `-` lines from
+    /// file 1, `+` and context lines from file 2. The old renderer took context from
+    /// file 1, which mixed both arms' identifiers within one hunk and read as
+    /// corrupted code whenever names differed between arms.
+    pub fn generate_alpha_display_diff(
+        orig1: &str, orig2: &str,
+        norm_lines1: &[String], norm_lines2: &[String],
+        context_lines: usize,
+    ) -> String {
+        use similar::{ChangeTag, TextDiff};
+
+        let n1: Vec<&str> = norm_lines1.iter().map(|s| s.as_str()).collect();
+        let n2: Vec<&str> = norm_lines2.iter().map(|s| s.as_str()).collect();
+        let diff = TextDiff::from_slices(&n1, &n2);
+        let orig_lines1: Vec<&str> = orig1.lines().collect();
+        let orig_lines2: Vec<&str> = orig2.lines().collect();
+
+        let mut output = String::new();
+        let mut has_changes = false;
+
+        for hunk in diff.unified_diff().context_radius(context_lines).iter_hunks() {
+            has_changes = true;
+            output.push_str(&format!("{}\n", hunk.header()));
+            for change in hunk.iter_changes() {
+                let (sign, orig_line) = match change.tag() {
+                    ChangeTag::Delete => ("-", change.old_index()
+                        .and_then(|i| orig_lines1.get(i)).copied().unwrap_or("")),
+                    ChangeTag::Insert => ("+", change.new_index()
+                        .and_then(|i| orig_lines2.get(i)).copied().unwrap_or("")),
+                    ChangeTag::Equal => (" ", change.new_index()
+                        .and_then(|i| orig_lines2.get(i)).copied().unwrap_or("")),
+                };
+
+                output.push_str(sign);
+                output.push_str(orig_line);
+                output.push('\n');
             }
         }
 
