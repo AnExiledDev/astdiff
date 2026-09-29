@@ -386,7 +386,6 @@ impl ParallelMatcherV2 {
         source2: &str,
     ) -> (Vec<(usize, usize)>, Vec<Change>, HashMap<String, String>) {
         use super::profiling::Timer;
-        use super::StructuralDiff;
 
         // Pre-compute source lines to avoid repeated parsing
         let _timer = Timer::new("precompute_source_lines");
@@ -425,140 +424,31 @@ impl ParallelMatcherV2 {
         eprintln!("Phase A: {} matches, {} renames", matches.len(), rename_map.len());
 
         // ── Phase B: Normalize + diff all matched pairs ──
+        // Once the rename map is fixed the pairs are independent, so they are diffed in
+        // parallel, one tokenizer per rayon split since a tree-sitter Parser is not Sync.
+        // The indexed collect keeps match order, so changes come out as they did serially.
+        let outcomes: Vec<(PairTally, Option<Change>)> = match_data
+            .par_iter()
+            .map_init(alpha::AlphaTokenizer::new, |tokenizer, &(i1, i2, similarity)| {
+                diff_matched_pair(
+                    tokenizer, &decls1[i1], &decls2[i2], similarity, &lines1, &lines2, &rename_map,
+                )
+            })
+            .collect();
+
         let mut unchanged_count = 0usize;
         let mut string_only_count = 0usize;
         let mut structural_count = 0usize;
-        let mut tokenizer = alpha::AlphaTokenizer::new();
 
-        for &(i1, i2, similarity) in &match_data {
-            let decl1 = &decls1[i1];
-            let decl2 = &decls2[i2];
-
-            // Extract source for both declarations
-            let src1 = super::extract_source_range(&lines1, decl1.line, decl1.end_line);
-            let src2 = super::extract_source_range(&lines2, decl2.line, decl2.end_line);
-
-            if src1.is_empty() || src2.is_empty() {
-                // Can't extract source — skip diffing
-                if decl1.name != decl2.name {
-                    changes.push(create_classified_change(
-                        ChangeType::Modification,
-                        Some(create_location_with_lines(decl1, &lines1)),
-                        Some(create_location_with_lines(decl2, &lines2)),
-                        format!("{} '{}' matched with '{}' (was '{}')",
-                            kind_to_string(&decl1.kind), decl2.name, decl1.name, decl1.name),
-                        format!("global.{}->{}", decl1.name, decl2.name),
-                        DiffClassification::Unchanged,
-                        String::new(),
-                        Some(similarity),
-                    ));
-                    unchanged_count += 1;
-                }
-                continue;
+        for (tally, change) in outcomes {
+            match tally {
+                PairTally::Uncounted => {}
+                PairTally::Unchanged => unchanged_count += 1,
+                PairTally::StringOnly => string_only_count += 1,
+                PairTally::Structural => structural_count += 1,
             }
 
-            let is_import = matches!(decl1.kind, DeclarationKind::Import);
-
-            let (classification, display_diff) = if is_import {
-                // Imports keep the string-normalization path: import canonicalization
-                // collapses multiline import lists, which token comparison would
-                // misread as churn.
-                let pre_s1 = fingerprint::normalize_for_comparison(&src1, true);
-                let pre_s2 = fingerprint::normalize_for_comparison(&src2, true);
-
-                let renamed = if rename_map.is_empty() {
-                    pre_s2
-                } else {
-                    fingerprint::normalize_string_with_renames(&pre_s2, &rename_map)
-                };
-                let comp_s1 = fingerprint::normalize_minified_identifiers(&pre_s1);
-                let comp_s2 = fingerprint::normalize_minified_identifiers(&renamed);
-
-                if comp_s1 == comp_s2 {
-                    (DiffClassification::Unchanged, String::new())
-                } else {
-                    let display_diff = StructuralDiff::generate_normalized_display_diff(
-                        &src1, &src2, &comp_s1, &comp_s2, 3,
-                    );
-
-                    if display_diff.is_empty() {
-                        (DiffClassification::Unchanged, String::new())
-                    } else {
-                        (fingerprint::classify_diff_lines(&display_diff), display_diff)
-                    }
-                }
-            } else {
-                // Token-level alpha-equivalence: a consistent rename (top-level or
-                // function-local, any identifier length) compares equal, and masking
-                // string content separates string-only edits from structural ones.
-                let t1 = tokenizer.tokenize(&src1);
-                let t2 = tokenizer.tokenize(&src2);
-
-                if alpha::alpha_equal(&t1, &t2) {
-                    (DiffClassification::Unchanged, String::new())
-                } else {
-                    let classification = if alpha::alpha_equal_masked(&t1, &t2) {
-                        DiffClassification::StringOnly
-                    } else {
-                        DiffClassification::Structural
-                    };
-                    let display_diff = StructuralDiff::generate_alpha_display_diff(
-                        &src1, &src2, &t1.norm_lines(), &t2.norm_lines(), 3,
-                    );
-
-                    (classification, display_diff)
-                }
-            };
-
-            if matches!(classification, DiffClassification::Unchanged) {
-                unchanged_count += 1;
-                continue;
-            }
-
-            let desc = if decl1.name != decl2.name {
-                match classification {
-                    DiffClassification::StringOnly =>
-                        format!("{} '{}' (was '{}') — string-only",
-                            kind_to_string(&decl1.kind), decl2.name, decl1.name),
-                    DiffClassification::Structural =>
-                        format!("{} '{}' (was '{}') — structural ({:.1}%)",
-                            kind_to_string(&decl1.kind), decl2.name, decl1.name, similarity * 100.0),
-                    DiffClassification::Unchanged => unreachable!(),
-                }
-            } else {
-                match classification {
-                    DiffClassification::StringOnly =>
-                        format!("{} '{}' — string-only",
-                            kind_to_string(&decl1.kind), decl1.name),
-                    DiffClassification::Structural =>
-                        format!("{} '{}' — structural ({:.1}%)",
-                            kind_to_string(&decl1.kind), decl1.name, similarity * 100.0),
-                    DiffClassification::Unchanged => unreachable!(),
-                }
-            };
-
-            let structural_path = if decl1.name != decl2.name {
-                format!("global.{}->{}", decl1.name, decl2.name)
-            } else {
-                format!("global.{}", decl1.name)
-            };
-
-            match classification {
-                DiffClassification::StringOnly => string_only_count += 1,
-                DiffClassification::Structural => structural_count += 1,
-                _ => {}
-            }
-
-            changes.push(create_classified_change(
-                ChangeType::Modification,
-                Some(create_location_with_lines(decl1, &lines1)),
-                Some(create_location_with_lines(decl2, &lines2)),
-                desc,
-                structural_path,
-                classification,
-                display_diff,
-                Some(similarity),
-            ));
+            changes.extend(change);
         }
 
         eprintln!("Phase B: {} unchanged, {} string-only, {} structural",
@@ -594,6 +484,153 @@ impl ParallelMatcherV2 {
 }
 
 // Helper functions
+
+/// How one matched pair counts toward the Phase B summary line.
+enum PairTally {
+    /// Source could not be extracted and the names agree: no change, not counted.
+    Uncounted,
+    Unchanged,
+    StringOnly,
+    Structural,
+}
+
+/// Classify and diff one matched pair: the per-pair body of Phase B.
+fn diff_matched_pair(
+    tokenizer: &mut alpha::AlphaTokenizer,
+    decl1: &DeclarationData,
+    decl2: &DeclarationData,
+    similarity: f64,
+    lines1: &[&str],
+    lines2: &[&str],
+    rename_map: &HashMap<String, String>,
+) -> (PairTally, Option<Change>) {
+    use super::StructuralDiff;
+
+    // Extract source for both declarations
+    let src1 = super::extract_source_range(lines1, decl1.line, decl1.end_line);
+    let src2 = super::extract_source_range(lines2, decl2.line, decl2.end_line);
+
+    if src1.is_empty() || src2.is_empty() {
+        // Can't extract source — skip diffing
+        if decl1.name != decl2.name {
+            return (PairTally::Unchanged, Some(create_classified_change(
+                ChangeType::Modification,
+                Some(create_location_with_lines(decl1, lines1)),
+                Some(create_location_with_lines(decl2, lines2)),
+                format!("{} '{}' matched with '{}' (was '{}')",
+                    kind_to_string(&decl1.kind), decl2.name, decl1.name, decl1.name),
+                format!("global.{}->{}", decl1.name, decl2.name),
+                DiffClassification::Unchanged,
+                String::new(),
+                Some(similarity),
+            )));
+        }
+
+        return (PairTally::Uncounted, None);
+    }
+
+    let is_import = matches!(decl1.kind, DeclarationKind::Import);
+
+    let (classification, display_diff) = if is_import {
+        // Imports keep the string-normalization path: import canonicalization
+        // collapses multiline import lists, which token comparison would
+        // misread as churn.
+        let pre_s1 = fingerprint::normalize_for_comparison(&src1, true);
+        let pre_s2 = fingerprint::normalize_for_comparison(&src2, true);
+
+        let renamed = if rename_map.is_empty() {
+            pre_s2
+        } else {
+            fingerprint::normalize_string_with_renames(&pre_s2, rename_map)
+        };
+        let comp_s1 = fingerprint::normalize_minified_identifiers(&pre_s1);
+        let comp_s2 = fingerprint::normalize_minified_identifiers(&renamed);
+
+        if comp_s1 == comp_s2 {
+            (DiffClassification::Unchanged, String::new())
+        } else {
+            let display_diff = StructuralDiff::generate_normalized_display_diff(
+                &src1, &src2, &comp_s1, &comp_s2, 3,
+            );
+
+            if display_diff.is_empty() {
+                (DiffClassification::Unchanged, String::new())
+            } else {
+                (fingerprint::classify_diff_lines(&display_diff), display_diff)
+            }
+        }
+    } else {
+        // Token-level alpha-equivalence: a consistent rename (top-level or
+        // function-local, any identifier length) compares equal, and masking
+        // string content separates string-only edits from structural ones.
+        let t1 = tokenizer.tokenize(&src1);
+        let t2 = tokenizer.tokenize(&src2);
+
+        if alpha::alpha_equal(&t1, &t2) {
+            (DiffClassification::Unchanged, String::new())
+        } else {
+            let classification = if alpha::alpha_equal_masked(&t1, &t2) {
+                DiffClassification::StringOnly
+            } else {
+                DiffClassification::Structural
+            };
+            let display_diff = StructuralDiff::generate_alpha_display_diff(
+                &src1, &src2, &t1.norm_lines(), &t2.norm_lines(), 3,
+            );
+
+            (classification, display_diff)
+        }
+    };
+
+    if matches!(classification, DiffClassification::Unchanged) {
+        return (PairTally::Unchanged, None);
+    }
+
+    let desc = if decl1.name != decl2.name {
+        match classification {
+            DiffClassification::StringOnly =>
+                format!("{} '{}' (was '{}') — string-only",
+                    kind_to_string(&decl1.kind), decl2.name, decl1.name),
+            DiffClassification::Structural =>
+                format!("{} '{}' (was '{}') — structural ({:.1}%)",
+                    kind_to_string(&decl1.kind), decl2.name, decl1.name, similarity * 100.0),
+            DiffClassification::Unchanged => unreachable!(),
+        }
+    } else {
+        match classification {
+            DiffClassification::StringOnly =>
+                format!("{} '{}' — string-only",
+                    kind_to_string(&decl1.kind), decl1.name),
+            DiffClassification::Structural =>
+                format!("{} '{}' — structural ({:.1}%)",
+                    kind_to_string(&decl1.kind), decl1.name, similarity * 100.0),
+            DiffClassification::Unchanged => unreachable!(),
+        }
+    };
+
+    let structural_path = if decl1.name != decl2.name {
+        format!("global.{}->{}", decl1.name, decl2.name)
+    } else {
+        format!("global.{}", decl1.name)
+    };
+
+    let tally = match classification {
+        DiffClassification::StringOnly => PairTally::StringOnly,
+        DiffClassification::Structural => PairTally::Structural,
+        DiffClassification::Unchanged => unreachable!(),
+    };
+
+    (tally, Some(create_classified_change(
+        ChangeType::Modification,
+        Some(create_location_with_lines(decl1, lines1)),
+        Some(create_location_with_lines(decl2, lines2)),
+        desc,
+        structural_path,
+        classification,
+        display_diff,
+        Some(similarity),
+    )))
+}
 
 fn estimate_minhash_similarity(sig1: &[u64], sig2: &[u64]) -> f64 {
     let matches = sig1.iter().zip(sig2).filter(|(a, b)| a == b).count();
