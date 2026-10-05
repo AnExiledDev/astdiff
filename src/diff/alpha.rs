@@ -246,7 +246,8 @@ fn push_leaf(
 
     let tok = match kind {
         "identifier" | "statement_identifier" | "private_property_identifier" => {
-            NormTok::Var(index_ident(out, var_ids, text, in_binding_slot || kind != "identifier"))
+            let is_local = in_binding_slot || kind != "identifier";
+            NormTok::Var(index_ident(out, var_ids, text, is_local))
         }
         "string_fragment" | "escape_sequence" => NormTok::Str(text.into()),
         _ => NormTok::Lit(text.into()),
@@ -268,7 +269,10 @@ fn index_ident(
     let id = *var_ids.entry(text.to_string()).or_insert(next_id);
 
     if id == next_id {
-        out.idents.push(Ident { name: text.into(), is_local });
+        out.idents.push(Ident {
+            name: text.into(),
+            is_local,
+        });
     } else if is_local {
         out.idents[id as usize].is_local = true;
     }
