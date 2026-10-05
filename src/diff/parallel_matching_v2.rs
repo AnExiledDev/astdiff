@@ -559,12 +559,15 @@ impl<'a> TopLevelPairing<'a> {
     }
 
     /// Whether the reference read as `old_name` in `decl1` and `new_name` in
-    /// `decl2` changed what it points at. Each name resolves to the nearest
-    /// declaration of that name on its own side; the reference is re-pointed
-    /// when those two were not matched to each other, a contradicting partner
-    /// sits near the pair (so the pairing has a local answer that differs), and
-    /// the two declarations are not look-alikes Phase A could have
-    /// cross-paired. A removed name read as an added one contradicts nothing.
+    /// `decl2` changed what it points at. Each name stands for every
+    /// declaration of that name near its pair on its own side, since nearness
+    /// alone cannot tell a reused short name's binding from a neighbour. The
+    /// reference is re-pointed only when no old target was matched to a new
+    /// one, a contradicting partner sits near the pair (so the pairing has a
+    /// local answer that differs), and no old target is a look-alike of a new
+    /// one that Phase A could have cross-paired. A name with no declaration
+    /// nearby (removed, or bound where nothing is extracted) contradicts
+    /// nothing.
     fn is_repointed(
         &self,
         tokenizer: &mut alpha::AlphaTokenizer,
@@ -573,30 +576,36 @@ impl<'a> TopLevelPairing<'a> {
         decl1: &DeclarationData,
         decl2: &DeclarationData,
     ) -> bool {
-        let Some(i1) = self.old.resolve(old_name, decl1) else {
-            return false;
-        };
-        let Some(i2) = self.new.resolve(new_name, decl2) else {
-            return false;
-        };
-        let expected_new = self.old.partner[i1];
-        let expected_old = self.new.partner[i2];
+        let old_targets = self.old.near(old_name, decl1);
+        let new_targets = self.new.near(new_name, decl2);
 
-        if expected_new == Some(i2) {
+        if old_targets.is_empty() || new_targets.is_empty() {
             return false;
         }
 
-        let is_contradicted_nearby = expected_new.is_some_and(|p| self.new.is_near(p, decl2))
-            || expected_old.is_some_and(|p| self.old.is_near(p, decl1));
+        let is_paired = old_targets
+            .iter()
+            .filter_map(|&i1| self.old.partner[i1])
+            .any(|i2| new_targets.contains(&i2));
+
+        if is_paired {
+            return false;
+        }
+
+        let is_contradicted_nearby = self.old.has_partner_near(old_targets, &self.new, decl2)
+            || self.new.has_partner_near(new_targets, &self.old, decl1);
 
         if !is_contradicted_nearby {
             return false;
         }
 
-        let old_target = tokenizer.tokenize(&self.old.declarator_text(i1));
-        let new_target = tokenizer.tokenize(&self.new.declarator_text(i2));
+        let old_shapes = self.old.shapes(tokenizer, old_targets);
+        let new_shapes = self.new.shapes(tokenizer, new_targets);
+        let is_look_alike = old_shapes
+            .iter()
+            .any(|a| new_shapes.iter().any(|b| alpha::alpha_equal_masked(a, b)));
 
-        !alpha::alpha_equal_masked(&old_target, &new_target)
+        !is_look_alike
     }
 }
 
@@ -620,24 +629,51 @@ impl<'a> TopLevelSide<'a> {
         }
     }
 
-    /// The declaration named `name` nearest to `from`, if one lies within
-    /// [`NEIGHBOURHOOD_LINES`]. Top-level declarations do not overlap, so the
-    /// nearest is one of the two around `from`'s first line.
-    fn resolve(&self, name: &str, from: &DeclarationData) -> Option<usize> {
-        let candidates = self.by_name.get(name)?;
-        let after = candidates.partition_point(|&index| self.decls[index].line < from.line);
-        let before = after.checked_sub(1).map(|k| candidates[k]);
-        let next = candidates.get(after).copied();
+    /// The declarations named `name` within [`NEIGHBOURHOOD_LINES`] of
+    /// `from`, in line order. Top-level declarations do not overlap, so their
+    /// end lines rise with their start lines and two binary searches bound
+    /// the window.
+    fn near(&self, name: &str, from: &DeclarationData) -> &[usize] {
+        let Some(candidates) = self.by_name.get(name) else {
+            return &[];
+        };
+        let window_start = from.line.saturating_sub(NEIGHBOURHOOD_LINES);
+        let window_end = from.end_line + NEIGHBOURHOOD_LINES;
+        let start = candidates.partition_point(|&index| self.decls[index].end_line < window_start);
+        let end = candidates.partition_point(|&index| self.decls[index].line <= window_end);
 
-        [before, next]
-            .into_iter()
-            .flatten()
-            .filter(|&index| self.is_near(index, from))
-            .min_by_key(|&index| line_gap(&self.decls[index], from))
+        // Overlapping spans would break the ordering; an empty window beats a panic.
+        &candidates[start..end.max(start)]
     }
 
     fn is_near(&self, index: usize, from: &DeclarationData) -> bool {
         line_gap(&self.decls[index], from) <= NEIGHBOURHOOD_LINES
+    }
+
+    /// Whether any of `targets` was matched to a declaration on the `other`
+    /// side within [`NEIGHBOURHOOD_LINES`] of `from`.
+    fn has_partner_near(
+        &self,
+        targets: &[usize],
+        other: &TopLevelSide,
+        from: &DeclarationData,
+    ) -> bool {
+        targets
+            .iter()
+            .any(|&index| self.partner[index].is_some_and(|p| other.is_near(p, from)))
+    }
+
+    /// The declarator text of each of `targets`, tokenized for comparing
+    /// declarations by shape.
+    fn shapes(
+        &self,
+        tokenizer: &mut alpha::AlphaTokenizer,
+        targets: &[usize],
+    ) -> Vec<alpha::AlphaTokens> {
+        targets
+            .iter()
+            .map(|&index| tokenizer.tokenize(&self.declarator_text(index)))
+            .collect()
     }
 
     /// The source of declaration `index` without the `var`/`let`/`const` a
@@ -1077,15 +1113,18 @@ mod tests {
             .unwrap_or_else(|| panic!("fixture declares '{name}'"))
     }
 
-    /// A fixture declaration by name and first line, for fixtures that
-    /// declare one name more than once.
+    /// A fixture declaration by name and occurrence (0 for the first
+    /// declaration of that name), for fixtures that declare a name twice.
     type At = (&'static str, usize);
 
-    fn index_at(decls: &[DeclarationData], (name, line): At) -> usize {
+    fn index_at(decls: &[DeclarationData], (name, nth): At) -> usize {
         decls
             .iter()
-            .position(|decl| decl.name == name && decl.line == line)
-            .unwrap_or_else(|| panic!("fixture declares '{name}' on line {line}"))
+            .enumerate()
+            .filter(|(_, decl)| decl.name == name)
+            .nth(nth)
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| panic!("fixture declares '{name}' more than {nth} times"))
     }
 
     /// Phase B for the pair `old_name -> new_name`, with Phase A's outcome
@@ -1108,7 +1147,7 @@ mod tests {
         diff_indexed(old_src, new_src, &decls1, &decls2, &matches, pair)
     }
 
-    /// [`diff_pair`] with every declaration named by its first line as well.
+    /// [`diff_pair`] with every declaration named by its occurrence as well.
     fn diff_at(
         old_src: &str,
         new_src: &str,
@@ -1256,7 +1295,8 @@ mod tests {
     }
 
     /// Two regions that reuse the same short names at top level, as
-    /// concatenated scopes in a minified bundle do. The first holds a base,
+    /// concatenated scopes in a minified bundle do, split by a blank line
+    /// that [`spread`] widens past the neighbourhood. The first holds a base,
     /// an override and a table; the second, three helpers.
     const OLD_REGIONS: &str = r#"var e = { low: "a", high: "b" },
   f = { ...e, high: "c" },
@@ -1264,10 +1304,6 @@ mod tests {
     default: f,
     "model-x": e,
   };
-function pad(n) {
-  const out = n;
-  return out;
-}
 
 var e = (n) => n + 1,
   f = (n) => n * 2,
@@ -1283,10 +1319,6 @@ var e = (n) => n + 1,
     default: g,
     "model-x": x,
   };
-function pad(n) {
-  const out = n;
-  return out;
-}
 
 var x = (n) => n + 1,
   g = (n) => n * 2,
@@ -1296,23 +1328,31 @@ var x = (n) => n + 1,
     /// Phase A's outcome for OLD_REGIONS -> REPOINTED_REGIONS: the first
     /// region's old override was removed and its new one added.
     const REGION_PAIRS: &[(At, At)] = &[
-        (("e", 1), ("g", 1)),
-        (("m", 3), ("k", 3)),
-        (("e", 12), ("x", 12)),
-        (("f", 13), ("g", 13)),
-        (("m", 14), ("k", 14)),
+        (("e", 0), ("g", 0)),
+        (("m", 0), ("k", 0)),
+        (("e", 1), ("x", 1)),
+        (("f", 1), ("g", 1)),
+        (("m", 1), ("k", 1)),
     ];
+
+    /// `regions` with the blank line between its regions widened so that
+    /// neither region is within the other's neighbourhood. Same-named
+    /// declarations inside one neighbourhood are deliberately read as
+    /// consistent, so the regions have to sit apart, as they do in a bundle.
+    fn spread(regions: &str) -> String {
+        regions.replace("\n\n", &"\n".repeat(NEIGHBOURHOOD_LINES + 50))
+    }
 
     #[test]
     fn a_table_repointed_among_names_reused_elsewhere_is_structural() {
         // Every name the table reads is declared again in the other region,
         // so the check has to follow each reference to its own neighbour.
         let (tally, change) = diff_at(
-            OLD_REGIONS,
-            REPOINTED_REGIONS,
+            &spread(OLD_REGIONS),
+            &spread(REPOINTED_REGIONS),
             REGION_PAIRS,
-            ("m", 3),
-            ("k", 3),
+            ("m", 0),
+            ("k", 0),
         );
         let change = change.expect("a re-pointed table is reported");
 
@@ -1330,16 +1370,16 @@ var x = (n) => n + 1,
     }
 
     #[test]
-    fn references_resolve_to_the_nearest_declaration_of_their_name() {
+    fn a_renamed_region_stays_unchanged_beside_a_repointed_one() {
         // The helper reads the second region's `f` and `e`, which follow the
         // pairing; the first region's same-named declarations do not, and must
         // not be taken for them.
         let (tally, change) = diff_at(
-            OLD_REGIONS,
-            REPOINTED_REGIONS,
+            &spread(OLD_REGIONS),
+            &spread(REPOINTED_REGIONS),
             REGION_PAIRS,
-            ("m", 14),
-            ("k", 14),
+            ("m", 1),
+            ("k", 1),
         );
 
         assert!(matches!(tally, PairTally::Unchanged));
@@ -1362,6 +1402,57 @@ var x = (n) => n + 1,
         let pairs = [("u", "z"), ("v", "s"), ("w", "y")];
 
         let (tally, change) = diff_pair(old, new, &pairs, "w", "y");
+
+        assert!(matches!(tally, PairTally::Unchanged));
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn a_reference_to_a_name_declared_twice_nearby_follows_either_declaration() {
+        // The next build declares `store` twice: the function the caller
+        // reads, and a class just below the caller. The class is the nearer
+        // of the two, but the function is the old one's partner, so the
+        // caller is a pure rename.
+        let old = r#"function loadStore() {
+  return { kind: "store" };
+}
+function pad(n) {
+  const out = n;
+  const twice = out * 2;
+  const thrice = out * 3;
+  return twice + thrice;
+}
+function start() {
+  return loadStore().open();
+}
+class Shelf {
+  open() {}
+}
+"#;
+        let new = r#"function store() {
+  return { kind: "store" };
+}
+function pad(n) {
+  const out = n;
+  const twice = out * 2;
+  const thrice = out * 3;
+  return twice + thrice;
+}
+function begin() {
+  return store().open();
+}
+class store {
+  open() {}
+}
+"#;
+        let pairs = [
+            (("loadStore", 0), ("store", 0)),
+            (("pad", 0), ("pad", 0)),
+            (("start", 0), ("begin", 0)),
+            (("Shelf", 0), ("store", 1)),
+        ];
+
+        let (tally, change) = diff_at(old, new, &pairs, ("start", 0), ("begin", 0));
 
         assert!(matches!(tally, PairTally::Unchanged));
         assert!(change.is_none());
