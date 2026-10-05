@@ -22,6 +22,12 @@
 //! The snippet is often a fragment (a lone `var` declarator, say); tree-sitter
 //! still lexes valid tokens inside its error recovery, and both sides of a
 //! pair mis-parse the same way, so the comparison stays symmetric.
+//!
+//! Alpha-equivalence alone picks its own identifier bijection, which is only
+//! right for names the snippet binds itself. A name it never binds is a free
+//! reference, usually to another top-level declaration, and those already
+//! have a global pairing; [`free_renames`] exposes them so the caller can hold
+//! them to it.
 
 use std::collections::HashMap;
 use tree_sitter::{Node, Parser};
@@ -43,6 +49,21 @@ pub struct AlphaTokens {
     toks: Vec<NormTok>,
     line_of: Vec<u32>,
     line_count: usize,
+    /// Every indexed identifier in index order: `NormTok::Var(n)` is `idents[n]`.
+    idents: Vec<Ident>,
+}
+
+/// The identifier behind one `NormTok::Var` index.
+struct Ident {
+    name: Box<str>,
+    /// Declared somewhere in the snippet itself (a parameter, a local, a catch
+    /// binding, a function or class name), or not a plain identifier at all
+    /// (a label, a `#field`). Either way it never names an outside declaration
+    /// and keeps plain alpha-equivalence. A name bound anywhere in the snippet
+    /// counts as bound everywhere in it: missing a shadowed outer reference only
+    /// falls back to the old behaviour, while a parameter mistaken for a free
+    /// reference would flag a pure rename.
+    is_local: bool,
 }
 
 /// A reusable tokenizer holding one tree-sitter parser.
@@ -61,19 +82,19 @@ impl AlphaTokenizer {
     }
 
     pub fn tokenize(&mut self, src: &str) -> AlphaTokens {
-        let mut toks = Vec::new();
-        let mut line_of = Vec::new();
+        let mut out = AlphaTokens {
+            toks: Vec::new(),
+            line_of: Vec::new(),
+            line_count: src.lines().count(),
+            idents: Vec::new(),
+        };
         let mut var_ids: HashMap<String, u32> = HashMap::new();
 
         if let Some(tree) = self.parser.parse(src, None) {
-            collect_leaves(tree.root_node(), src, &mut toks, &mut line_of, &mut var_ids);
+            collect_leaves(tree.root_node(), src, &mut out, &mut var_ids, false);
         }
 
-        AlphaTokens {
-            toks,
-            line_of,
-            line_count: src.lines().count(),
-        }
+        out
     }
 }
 
@@ -97,12 +118,40 @@ pub fn alpha_equal_masked(a: &AlphaTokens, b: &AlphaTokens) -> bool {
     })
 }
 
+/// The free references two snippets trade under their alpha bijection, as
+/// `(index, name in a, name in b)`: index `n` in `a` is read as index `n` in
+/// `b`. An index local to either side is left out. Only meaningful when
+/// [`alpha_equal_masked`] holds, since only then do the indices line up.
+pub fn free_renames<'t>(
+    a: &'t AlphaTokens,
+    b: &'t AlphaTokens,
+) -> impl Iterator<Item = (u32, &'t str, &'t str)> + 't {
+    a.idents
+        .iter()
+        .zip(&b.idents)
+        .enumerate()
+        .filter(|(_, (x, y))| !x.is_local && !y.is_local)
+        .map(|(n, (x, y))| (n as u32, &*x.name, &*y.name))
+}
+
 impl AlphaTokens {
     /// The normalized text of each source line (same line count as the input),
     /// for aligning original lines in the display diff. Distinct identifiers
     /// keep distinct indices, so lines stay distinguishable after
     /// normalization instead of collapsing into one degenerate blank form.
     pub fn norm_lines(&self) -> Vec<String> {
+        self.render_lines(&[], ' ')
+    }
+
+    /// [`AlphaTokens::norm_lines`], with every index in `flagged` suffixed by
+    /// `tag`. Tagging the two sides differently keeps any line that uses a
+    /// flagged index from aligning with its counterpart, so the display diff
+    /// shows exactly those lines even when the token streams are equal.
+    pub fn norm_lines_flagging(&self, flagged: &[u32], tag: char) -> Vec<String> {
+        self.render_lines(flagged, tag)
+    }
+
+    fn render_lines(&self, flagged: &[u32], tag: char) -> Vec<String> {
         let mut lines = vec![String::new(); self.line_count];
 
         for (tok, &line) in self.toks.iter().zip(&self.line_of) {
@@ -117,6 +166,10 @@ impl AlphaTokens {
                 NormTok::Var(n) => {
                     slot.push('%');
                     slot.push_str(&n.to_string());
+
+                    if flagged.contains(n) {
+                        slot.push(tag);
+                    }
                 }
                 NormTok::Lit(s) | NormTok::Str(s) => slot.push_str(s),
             }
@@ -126,22 +179,25 @@ impl AlphaTokens {
     }
 }
 
+/// `in_binding_slot` says whether `node` sits where its parent declares a name
+/// (see [`is_binding_slot`]); it only matters once `node` is an identifier leaf.
 fn collect_leaves(
     node: Node,
     src: &str,
-    toks: &mut Vec<NormTok>,
-    line_of: &mut Vec<u32>,
+    out: &mut AlphaTokens,
     var_ids: &mut HashMap<String, u32>,
+    in_binding_slot: bool,
 ) {
     if node.child_count() == 0 {
-        push_leaf(node, src, toks, line_of, var_ids);
+        push_leaf(node, src, out, var_ids, in_binding_slot);
         return;
     }
 
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
-            collect_leaves(cursor.node(), src, toks, line_of, var_ids);
+            let child_binds = is_binding_slot(node.kind(), cursor.field_name());
+            collect_leaves(cursor.node(), src, out, var_ids, child_binds);
 
             if !cursor.goto_next_sibling() {
                 break;
@@ -150,12 +206,35 @@ fn collect_leaves(
     }
 }
 
+/// Whether a child in `field` of a `parent_kind` node declares a name: a
+/// parameter, a declarator or function/class name, a catch or loop binding, or
+/// a name inside a destructuring pattern. Errs toward "declares" (a plain
+/// `for (x in y)` or a destructuring assignment counts too), because a name
+/// wrongly taken as local only loses the free-reference check.
+fn is_binding_slot(parent_kind: &str, field: Option<&str>) -> bool {
+    match parent_kind {
+        "formal_parameters" | "array_pattern" | "rest_pattern" => true,
+        "variable_declarator"
+        | "function_declaration"
+        | "function_expression"
+        | "function"
+        | "generator_function_declaration"
+        | "generator_function"
+        | "class_declaration"
+        | "class" => field == Some("name"),
+        "arrow_function" | "catch_clause" => field == Some("parameter"),
+        "for_in_statement" | "assignment_pattern" => field == Some("left"),
+        "pair_pattern" => field == Some("value"),
+        _ => false,
+    }
+}
+
 fn push_leaf(
     node: Node,
     src: &str,
-    toks: &mut Vec<NormTok>,
-    line_of: &mut Vec<u32>,
+    out: &mut AlphaTokens,
     var_ids: &mut HashMap<String, u32>,
+    in_binding_slot: bool,
 ) {
     let kind = node.kind();
 
@@ -167,15 +246,34 @@ fn push_leaf(
 
     let tok = match kind {
         "identifier" | "statement_identifier" | "private_property_identifier" => {
-            let next_id = var_ids.len() as u32;
-            NormTok::Var(*var_ids.entry(text.to_string()).or_insert(next_id))
+            NormTok::Var(index_ident(out, var_ids, text, in_binding_slot || kind != "identifier"))
         }
         "string_fragment" | "escape_sequence" => NormTok::Str(text.into()),
         _ => NormTok::Lit(text.into()),
     };
 
-    toks.push(tok);
-    line_of.push(node.start_position().row as u32);
+    out.toks.push(tok);
+    out.line_of.push(node.start_position().row as u32);
+}
+
+/// The index of identifier `text`, recording it on first sight and marking it
+/// local once any occurrence is.
+fn index_ident(
+    out: &mut AlphaTokens,
+    var_ids: &mut HashMap<String, u32>,
+    text: &str,
+    is_local: bool,
+) -> u32 {
+    let next_id = var_ids.len() as u32;
+    let id = *var_ids.entry(text.to_string()).or_insert(next_id);
+
+    if id == next_id {
+        out.idents.push(Ident { name: text.into(), is_local });
+    } else if is_local {
+        out.idents[id as usize].is_local = true;
+    }
+
+    id
 }
 
 #[cfg(test)]
@@ -273,6 +371,45 @@ mod tests {
         let b = toks("var u = wait(2000);");
         assert!(!alpha_equal(&a, &b));
         assert!(!alpha_equal_masked(&a, &b));
+    }
+
+    fn free_names(a: &AlphaTokens, b: &AlphaTokens) -> Vec<(String, String)> {
+        free_renames(a, b)
+            .map(|(_, x, y)| (x.to_string(), y.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn free_renames_pair_outside_references_only() {
+        // `run` and `base` are declared elsewhere; `x`, `y` and the arrow's
+        // `e` are bound by the snippet and keep plain alpha-equivalence.
+        let a = toks("function f(x, { k: y }) { return run(base, x, y, (e) => e); }");
+        let b = toks("function g(p, { k: q }) { return go(table, p, q, (s) => s); }");
+        assert!(alpha_equal(&a, &b));
+        assert_eq!(
+            free_names(&a, &b),
+            vec![
+                ("run".to_string(), "go".to_string()),
+                ("base".to_string(), "table".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_bound_anywhere_in_the_snippet_is_never_free() {
+        // `base` is a parameter here, even though the same text could name
+        // a top-level declaration; it must not be held to a global pairing.
+        let a = toks("var r = function (base) { return base.low; };");
+        let b = toks("var s = function (other) { return other.low; };");
+        assert!(free_names(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn flagged_lines_stop_aligning() {
+        let t = toks("var ab = 1;\nvar cd = ab + 2;");
+        let lines = t.norm_lines_flagging(&[0], '-');
+        assert_eq!(lines[0], "var %0- = 1 ;");
+        assert_eq!(lines[1], "var %1 = %0- + 2 ;");
     }
 
     #[test]

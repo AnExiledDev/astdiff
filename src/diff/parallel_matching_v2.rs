@@ -423,6 +423,8 @@ impl ParallelMatcherV2 {
 
         eprintln!("Phase A: {} matches, {} renames", matches.len(), rename_map.len());
 
+        let pairing = TopLevelPairing::new(&matches, decls1, decls2);
+
         // ── Phase B: Normalize + diff all matched pairs ──
         // Once the rename map is fixed the pairs are independent, so they are diffed in
         // parallel, one tokenizer per rayon split since a tree-sitter Parser is not Sync.
@@ -431,7 +433,8 @@ impl ParallelMatcherV2 {
             .par_iter()
             .map_init(alpha::AlphaTokenizer::new, |tokenizer, &(i1, i2, similarity)| {
                 diff_matched_pair(
-                    tokenizer, &decls1[i1], &decls2[i2], similarity, &lines1, &lines2, &rename_map,
+                    tokenizer, &decls1[i1], &decls2[i2], similarity, &lines1, &lines2,
+                    &rename_map, &pairing,
                 )
             })
             .collect();
@@ -485,6 +488,81 @@ impl ParallelMatcherV2 {
 
 // Helper functions
 
+/// The global pairing of top-level declaration names that Phase A settled, in
+/// both directions. Unlike `rename_map` it also holds the pairs whose name did
+/// not change, since a reference to an unrenamed declaration is pinned too.
+struct TopLevelPairing<'a> {
+    old_to_new: HashMap<&'a str, Partner<'a>>,
+    new_to_old: HashMap<&'a str, Partner<'a>>,
+}
+
+/// What one top-level name is paired with on the other side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Partner<'a> {
+    Name(&'a str),
+    /// The name heads more than one matched pair (a redeclared `var`, say), so
+    /// a reference to it cannot be pinned to one partner and is not checked.
+    Ambiguous,
+}
+
+impl<'a> TopLevelPairing<'a> {
+    fn new(
+        matches: &[(usize, usize)],
+        decls1: &'a [DeclarationData],
+        decls2: &'a [DeclarationData],
+    ) -> Self {
+        let mut old_to_new = HashMap::with_capacity(matches.len());
+        let mut new_to_old = HashMap::with_capacity(matches.len());
+
+        for &(i1, i2) in matches {
+            let old = decls1[i1].name.as_str();
+            let new = decls2[i2].name.as_str();
+            pin(&mut old_to_new, old, new);
+            pin(&mut new_to_old, new, old);
+        }
+
+        Self { old_to_new, new_to_old }
+    }
+
+    /// Whether reading the free reference `old` as `new` breaks the pairing:
+    /// `old` is paired with some other name, or `new` is. A removed name read
+    /// as an added one breaks nothing; either read as a paired name does.
+    fn contradicts(&self, old: &str, new: &str) -> bool {
+        paired_elsewhere(&self.old_to_new, old, new) || paired_elsewhere(&self.new_to_old, new, old)
+    }
+
+    /// The indices of the free references in a same-shape pair that point at
+    /// different top-level declarations than the pairing says. The pair's own
+    /// names are exempt: they are this match, whatever a duplicate name did to
+    /// the maps.
+    fn repointed_refs(
+        &self,
+        t1: &alpha::AlphaTokens,
+        t2: &alpha::AlphaTokens,
+        own_old: &str,
+        own_new: &str,
+    ) -> Vec<u32> {
+        alpha::free_renames(t1, t2)
+            .filter(|&(_, old, new)| !(old == own_old && new == own_new) && self.contradicts(old, new))
+            .map(|(index, _, _)| index)
+            .collect()
+    }
+}
+
+fn pin<'a>(map: &mut HashMap<&'a str, Partner<'a>>, from: &'a str, to: &'a str) {
+    map.entry(from)
+        .and_modify(|partner| {
+            if *partner != Partner::Name(to) {
+                *partner = Partner::Ambiguous;
+            }
+        })
+        .or_insert(Partner::Name(to));
+}
+
+fn paired_elsewhere(map: &HashMap<&str, Partner<'_>>, from: &str, to: &str) -> bool {
+    matches!(map.get(from), Some(Partner::Name(partner)) if *partner != to)
+}
+
 /// How one matched pair counts toward the Phase B summary line.
 enum PairTally {
     /// Source could not be extracted and the names agree: no change, not counted.
@@ -503,6 +581,7 @@ fn diff_matched_pair(
     lines1: &[&str],
     lines2: &[&str],
     rename_map: &HashMap<String, String>,
+    pairing: &TopLevelPairing,
 ) -> (PairTally, Option<Change>) {
     use super::StructuralDiff;
 
@@ -563,19 +642,34 @@ fn diff_matched_pair(
         // Token-level alpha-equivalence: a consistent rename (top-level or
         // function-local, any identifier length) compares equal, and masking
         // string content separates string-only edits from structural ones.
+        // The bijection it finds is its own, though, so free references to
+        // top-level declarations are also held to the Phase A pairing: a
+        // table re-pointed at different declarations is not a rename.
         let t1 = tokenizer.tokenize(&src1);
         let t2 = tokenizer.tokenize(&src2);
+        let is_same_shape = alpha::alpha_equal_masked(&t1, &t2);
+        let repointed = if is_same_shape {
+            pairing.repointed_refs(&t1, &t2, &decl1.name, &decl2.name)
+        } else {
+            Vec::new()
+        };
+        let is_rename_only = is_same_shape && repointed.is_empty();
 
-        if alpha::alpha_equal(&t1, &t2) {
+        if is_rename_only && alpha::alpha_equal(&t1, &t2) {
             (DiffClassification::Unchanged, String::new())
         } else {
-            let classification = if alpha::alpha_equal_masked(&t1, &t2) {
+            let classification = if is_rename_only {
                 DiffClassification::StringOnly
             } else {
                 DiffClassification::Structural
             };
+            let (norm1, norm2) = if repointed.is_empty() {
+                (t1.norm_lines(), t2.norm_lines())
+            } else {
+                (t1.norm_lines_flagging(&repointed, '-'), t2.norm_lines_flagging(&repointed, '+'))
+            };
             let display_diff = StructuralDiff::generate_alpha_display_diff(
-                &src1, &src2, &t1.norm_lines(), &t2.norm_lines(), 3,
+                &src1, &src2, &norm1, &norm2, 3,
             );
 
             (classification, display_diff)
@@ -757,5 +851,232 @@ fn kind_to_string(kind: &DeclarationKind) -> &'static str {
         DeclarationKind::Variable => "variable",
         DeclarationKind::Import => "import",
         DeclarationKind::Export => "export",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::StructuralDiff;
+
+    /// A base table, an override that spreads it and changes one key, and a
+    /// dispatch table pointing its default row at the override and one model
+    /// row at the base.
+    const OLD_TABLES: &str = r#"var pick = (cell) => ({ cell: cell, mode: "typed" }),
+  tierLow = { cell: "low", mode: "typed" },
+  baseTable = {
+    low: tierLow,
+    medium: { ...pick("alpha-min"), measured: !0 },
+    high: { ...pick("alpha-min"), measured: !0 },
+  },
+  overrideTable = { ...baseTable, high: { ...pick("beta-high"), measured: !0 } },
+  dispatchTable = {
+    default: overrideTable,
+    "model-y": { low: pick("y-low"), high: pick("y-high") },
+    "model-x": baseTable,
+  };
+"#;
+
+    /// The next build: the base is renamed and its strings edited, the old
+    /// override is gone, a new override is added, and the dispatch table is
+    /// re-pointed (default at the base, the model row at the new override).
+    /// Token for token the dispatch table is a pure rename of the old one.
+    const REPOINTED_TABLES: &str = r#"var choose = (cell) => ({ cell: cell, mode: "typed" }),
+  lowTier = { cell: "low", mode: "typed" },
+  rootTable = {
+    low: lowTier,
+    medium: { ...choose("beta-high"), measured: !0 },
+    high: { ...choose("beta-high"), measured: !0 },
+  },
+  patchTable = {
+    ...rootTable,
+    medium: { ...choose("alpha-min"), measured: !0 },
+    high: { ...choose("alpha-min"), measured: !0 },
+  },
+  routeTable = {
+    default: rootTable,
+    "model-y": { low: choose("y-low"), high: choose("y-high") },
+    "model-x": patchTable,
+  };
+"#;
+
+    /// OLD_TABLES with every name changed and nothing else.
+    const RENAMED_TABLES: &str = r#"var choose = (cell) => ({ cell: cell, mode: "typed" }),
+  lowTier = { cell: "low", mode: "typed" },
+  rootTable = {
+    low: lowTier,
+    medium: { ...choose("alpha-min"), measured: !0 },
+    high: { ...choose("alpha-min"), measured: !0 },
+  },
+  patchTable = { ...rootTable, high: { ...choose("beta-high"), measured: !0 } },
+  routeTable = {
+    default: patchTable,
+    "model-y": { low: choose("y-low"), high: choose("y-high") },
+    "model-x": rootTable,
+  };
+"#;
+
+    /// RENAMED_TABLES with the default and model rows swapped.
+    const SWAPPED_TABLES: &str = r#"var choose = (cell) => ({ cell: cell, mode: "typed" }),
+  lowTier = { cell: "low", mode: "typed" },
+  rootTable = {
+    low: lowTier,
+    medium: { ...choose("alpha-min"), measured: !0 },
+    high: { ...choose("alpha-min"), measured: !0 },
+  },
+  patchTable = { ...rootTable, high: { ...choose("beta-high"), measured: !0 } },
+  routeTable = {
+    default: rootTable,
+    "model-y": { low: choose("y-low"), high: choose("y-high") },
+    "model-x": patchTable,
+  };
+"#;
+
+    const ALL_RENAMED: &[(&str, &str)] = &[
+        ("pick", "choose"),
+        ("tierLow", "lowTier"),
+        ("baseTable", "rootTable"),
+        ("overrideTable", "patchTable"),
+        ("dispatchTable", "routeTable"),
+    ];
+
+    /// Phase A's outcome for OLD_TABLES -> REPOINTED_TABLES: the old override
+    /// was removed and the new one added, so neither is paired.
+    const REPOINTED_PAIRS: &[(&str, &str)] = &[
+        ("pick", "choose"),
+        ("tierLow", "lowTier"),
+        ("baseTable", "rootTable"),
+        ("dispatchTable", "routeTable"),
+    ];
+
+    fn declarations(src: &str) -> Vec<DeclarationData> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(tree_sitter_javascript::language())
+            .expect("tree-sitter-javascript language must load");
+        let tree = parser.parse(src, None).expect("fixture parses");
+
+        StructuralDiff::new()
+            .extract_declarations(tree.root_node(), src)
+            .into_iter()
+            .map(|decl| decl.into_data())
+            .collect()
+    }
+
+    fn index_of(decls: &[DeclarationData], name: &str) -> usize {
+        decls
+            .iter()
+            .position(|decl| decl.name == name)
+            .unwrap_or_else(|| panic!("fixture declares '{name}'"))
+    }
+
+    /// Phase B for the pair `old_name -> new_name`, with Phase A's outcome
+    /// given as `pairs` instead of left to the matcher's scoring.
+    fn diff_pair(
+        old_src: &str,
+        new_src: &str,
+        pairs: &[(&str, &str)],
+        old_name: &str,
+        new_name: &str,
+    ) -> (PairTally, Option<Change>) {
+        let decls1 = declarations(old_src);
+        let decls2 = declarations(new_src);
+        let matches: Vec<(usize, usize)> = pairs
+            .iter()
+            .map(|&(old, new)| (index_of(&decls1, old), index_of(&decls2, new)))
+            .collect();
+        let rename_map: HashMap<String, String> = pairs
+            .iter()
+            .filter(|&&(old, new)| old != new)
+            .map(|&(old, new)| (new.to_string(), old.to_string()))
+            .collect();
+        let pairing = TopLevelPairing::new(&matches, &decls1, &decls2);
+        let lines1: Vec<&str> = old_src.lines().collect();
+        let lines2: Vec<&str> = new_src.lines().collect();
+
+        diff_matched_pair(
+            &mut alpha::AlphaTokenizer::new(),
+            &decls1[index_of(&decls1, old_name)],
+            &decls2[index_of(&decls2, new_name)],
+            1.0,
+            &lines1,
+            &lines2,
+            &rename_map,
+            &pairing,
+        )
+    }
+
+    #[test]
+    fn a_table_repointed_at_other_declarations_is_structural() {
+        // The dispatch table now reads its default row from the base and its
+        // model row from the new override, which a local bijection would
+        // excuse as a rename (old override <-> base, base <-> new override).
+        let (tally, change) = diff_pair(
+            OLD_TABLES, REPOINTED_TABLES, REPOINTED_PAIRS, "dispatchTable", "routeTable",
+        );
+        let change = change.expect("a re-pointed table is reported");
+
+        assert!(matches!(tally, PairTally::Structural));
+        assert_eq!(change.classification, Some(DiffClassification::Structural));
+        assert!(
+            change.display_diff.contains(r#""model-x": patchTable"#),
+            "display diff shows the re-pointed model row:\n{}",
+            change.display_diff
+        );
+        assert!(
+            change.display_diff.contains("default: rootTable"),
+            "display diff shows the re-pointed default row:\n{}",
+            change.display_diff
+        );
+    }
+
+    #[test]
+    fn the_renamed_base_keeps_its_string_only_classification() {
+        // Its own references (the low tier, the helper) follow the pairing,
+        // so only its string edit is reported.
+        let (tally, change) = diff_pair(
+            OLD_TABLES, REPOINTED_TABLES, REPOINTED_PAIRS, "baseTable", "rootTable",
+        );
+
+        assert!(matches!(tally, PairTally::StringOnly));
+        assert_eq!(
+            change.and_then(|c| c.classification),
+            Some(DiffClassification::StringOnly)
+        );
+    }
+
+    #[test]
+    fn a_table_whose_references_follow_the_pairing_is_unchanged() {
+        let (tally, change) =
+            diff_pair(OLD_TABLES, RENAMED_TABLES, ALL_RENAMED, "dispatchTable", "routeTable");
+
+        assert!(matches!(tally, PairTally::Unchanged));
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn swapping_two_paired_references_is_structural() {
+        // Both targets are paired, each with the other's successor.
+        let (tally, change) =
+            diff_pair(OLD_TABLES, SWAPPED_TABLES, ALL_RENAMED, "dispatchTable", "routeTable");
+        let change = change.expect("a swap is reported");
+
+        assert!(matches!(tally, PairTally::Structural));
+        assert!(change.display_diff.contains(r#""model-x": patchTable"#));
+    }
+
+    #[test]
+    fn a_parameter_named_like_a_top_level_declaration_keeps_alpha_equivalence() {
+        // `baseTable` is a parameter here, not the top-level table, so its
+        // rename to `patchTable` is local even though both names are paired
+        // with other declarations.
+        let old = "var baseTable = { low: 1 },\n  overrideTable = { low: 2 },\n  lookup = (baseTable) => baseTable.low;\n";
+        let new = "var rootTable = { low: 1 },\n  patchTable = { low: 2 },\n  find = (patchTable) => patchTable.low;\n";
+        let pairs = [("baseTable", "rootTable"), ("overrideTable", "patchTable"), ("lookup", "find")];
+
+        let (tally, change) = diff_pair(old, new, &pairs, "lookup", "find");
+
+        assert!(matches!(tally, PairTally::Unchanged));
+        assert!(change.is_none());
     }
 }
