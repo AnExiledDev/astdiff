@@ -151,6 +151,32 @@ impl AlphaTokens {
         self.render_lines(flagged, tag)
     }
 
+    /// Whether the snippet only binds one name to another (`var a = b;`, or a
+    /// later declarator `a = b,`). Such a declaration carries nothing of its
+    /// own for a matcher to pair it by. Zero-width tokens are skipped: they
+    /// are what the parser inserts to recover from a fragment, not source.
+    pub fn is_bare_alias(&self) -> bool {
+        let source_toks = self.toks.iter().filter(|tok| !self.is_zero_width(tok));
+        let toks: Vec<&NormTok> = source_toks.collect();
+        let toks = match toks.split_first() {
+            Some((first, rest)) if is_lit(first, &["var", "let", "const"]) => rest,
+            _ => &toks[..],
+        };
+        let toks = match toks.split_last() {
+            Some((last, rest)) if is_lit(last, &[",", ";"]) => rest,
+            _ => toks,
+        };
+
+        matches!(toks, [NormTok::Var(_), eq, NormTok::Var(_)] if is_lit(eq, &["="]))
+    }
+
+    fn is_zero_width(&self, tok: &NormTok) -> bool {
+        match tok {
+            NormTok::Var(n) => self.idents[*n as usize].name.is_empty(),
+            NormTok::Lit(text) | NormTok::Str(text) => text.is_empty(),
+        }
+    }
+
     fn render_lines(&self, flagged: &[u32], tag: char) -> Vec<String> {
         let mut lines = vec![String::new(); self.line_count];
 
@@ -177,6 +203,11 @@ impl AlphaTokens {
 
         lines
     }
+}
+
+/// Whether `tok` is literal text equal to one of `texts`.
+fn is_lit(tok: &NormTok, texts: &[&str]) -> bool {
+    matches!(tok, NormTok::Lit(text) if texts.iter().any(|&t| t == &**text))
 }
 
 /// `in_binding_slot` says whether `node` sits where its parent declares a name
@@ -406,6 +437,21 @@ mod tests {
         let a = toks("var r = function (base) { return base.low; };");
         let b = toks("var s = function (other) { return other.low; };");
         assert!(free_names(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn a_declarator_binding_one_name_to_another_is_a_bare_alias() {
+        assert!(toks("var alias = base;").is_bare_alias());
+        assert!(toks("  alias = base,").is_bare_alias());
+        assert!(toks("  alias = base;").is_bare_alias());
+    }
+
+    #[test]
+    fn a_declarator_doing_anything_more_is_not_a_bare_alias() {
+        assert!(!toks("var alias = base.size;").is_bare_alias());
+        assert!(!toks("var alias = wrap(base);").is_bare_alias());
+        assert!(!toks("var alias = 1;").is_bare_alias());
+        assert!(!toks("var alias = base, other = next;").is_bare_alias());
     }
 
     #[test]

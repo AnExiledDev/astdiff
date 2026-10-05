@@ -564,10 +564,12 @@ impl<'a> TopLevelPairing<'a> {
     /// alone cannot tell a reused short name's binding from a neighbour. The
     /// reference is re-pointed only when no old target was matched to a new
     /// one, a contradicting partner sits near the pair (so the pairing has a
-    /// local answer that differs), and no old target is a look-alike of a new
-    /// one that Phase A could have cross-paired. A name with no declaration
-    /// nearby (removed, or bound where nothing is extracted) contradicts
-    /// nothing.
+    /// local answer that differs), and no old target is identical to a new one
+    /// up to renaming, a look-alike Phase A could have cross-paired. String
+    /// text counts here: siblings differing only in their strings are exactly
+    /// the targets a swapped reference trades between. A name with no
+    /// declaration nearby (removed, or bound where nothing is extracted)
+    /// contradicts nothing.
     fn is_repointed(
         &self,
         tokenizer: &mut alpha::AlphaTokenizer,
@@ -603,7 +605,7 @@ impl<'a> TopLevelPairing<'a> {
         let new_shapes = self.new.shapes(tokenizer, new_targets);
         let is_look_alike = old_shapes
             .iter()
-            .any(|a| new_shapes.iter().any(|b| alpha::alpha_equal_masked(a, b)));
+            .any(|a| new_shapes.iter().any(|b| alpha::alpha_equal(a, b)));
 
         !is_look_alike
     }
@@ -714,6 +716,7 @@ enum PairTally {
 }
 
 /// Classify and diff one matched pair: the per-pair body of Phase B.
+#[allow(clippy::too_many_arguments)]
 fn diff_matched_pair(
     tokenizer: &mut alpha::AlphaTokenizer,
     decl1: &DeclarationData,
@@ -785,11 +788,14 @@ fn diff_matched_pair(
         // string content separates string-only edits from structural ones.
         // The bijection it finds is its own, though, so free references to
         // top-level declarations are also held to the Phase A pairing: a
-        // table re-pointed at different declarations is not a rename.
+        // table re-pointed at different declarations is not a rename. A bare
+        // alias (`var a = b;`) is exempt: it has no body or strings for Phase
+        // A to pair it by, so a reference that disagrees with the pairing
+        // there says the alias pair is a guess, not that the code changed.
         let t1 = tokenizer.tokenize(&src1);
         let t2 = tokenizer.tokenize(&src2);
         let is_same_shape = alpha::alpha_equal_masked(&t1, &t2);
-        let repointed = if is_same_shape {
+        let repointed = if is_same_shape && !t1.is_bare_alias() {
             pairing.repointed_refs(tokenizer, &t1, &t2, decl1, decl2)
         } else {
             Vec::new()
@@ -1456,5 +1462,49 @@ class store {
 
         assert!(matches!(tally, PairTally::Unchanged));
         assert!(change.is_none());
+    }
+
+    #[test]
+    fn a_bare_alias_is_not_held_to_the_pairing() {
+        // The alias reads a different table's successor than the pairing
+        // says, but an alias has nothing of its own for Phase A to pair it
+        // by, so the disagreement indicts the alias pair, not the code.
+        let old = "var small = { size: 1 },\n  other = { size: 2 };\nvar alias = small;\n";
+        let new = "var tiny = { size: 1 },\n  large = { size: 2 };\nvar link = large;\n";
+        let pairs = [("small", "tiny"), ("other", "large"), ("alias", "link")];
+
+        let (tally, change) = diff_pair(old, new, &pairs, "alias", "link");
+
+        assert!(matches!(tally, PairTally::Unchanged));
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn a_swap_between_string_only_siblings_is_structural() {
+        // The two rows' targets differ only in a string, but they are still
+        // different code: swapping which row reads which is a real change.
+        let old = r#"var alpha = { medium: label("x") },
+  beta = { medium: label("y") },
+  table = { default: alpha, "m": beta };
+"#;
+        let new = r#"var first = { medium: label("x") },
+  second = { medium: label("y") },
+  routes = { default: second, "m": first };
+"#;
+        let pairs = [
+            ("alpha", "first"),
+            ("beta", "second"),
+            ("table", "routes"),
+        ];
+
+        let (tally, change) = diff_pair(old, new, &pairs, "table", "routes");
+        let change = change.expect("a swap is reported");
+
+        assert!(matches!(tally, PairTally::Structural));
+        assert!(
+            change.display_diff.contains("default: second"),
+            "display diff shows the swapped default row:\n{}",
+            change.display_diff
+        );
     }
 }
