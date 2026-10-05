@@ -699,10 +699,8 @@ impl<'a> TopLevelSide<'a> {
 fn line_gap(decl: &DeclarationData, from: &DeclarationData) -> usize {
     if decl.end_line < from.line {
         from.line - decl.end_line
-    } else if decl.line > from.end_line {
-        decl.line - from.end_line
     } else {
-        0
+        decl.line.saturating_sub(from.end_line)
     }
 }
 

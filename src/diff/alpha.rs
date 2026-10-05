@@ -207,7 +207,7 @@ impl AlphaTokens {
 
 /// Whether `tok` is literal text equal to one of `texts`.
 fn is_lit(tok: &NormTok, texts: &[&str]) -> bool {
-    matches!(tok, NormTok::Lit(text) if texts.iter().any(|&t| t == &**text))
+    matches!(tok, NormTok::Lit(text) if texts.contains(&&**text))
 }
 
 /// `in_binding_slot` says whether `node` sits where its parent declares a name
