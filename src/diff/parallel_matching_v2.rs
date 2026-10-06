@@ -423,17 +423,29 @@ impl ParallelMatcherV2 {
 
         eprintln!("Phase A: {} matches, {} renames", matches.len(), rename_map.len());
 
+        let pairing = TopLevelPairing::new(&matches, decls1, decls2, &lines1, &lines2);
+
         // ── Phase B: Normalize + diff all matched pairs ──
         // Once the rename map is fixed the pairs are independent, so they are diffed in
         // parallel, one tokenizer per rayon split since a tree-sitter Parser is not Sync.
         // The indexed collect keeps match order, so changes come out as they did serially.
         let outcomes: Vec<(PairTally, Option<Change>)> = match_data
             .par_iter()
-            .map_init(alpha::AlphaTokenizer::new, |tokenizer, &(i1, i2, similarity)| {
-                diff_matched_pair(
-                    tokenizer, &decls1[i1], &decls2[i2], similarity, &lines1, &lines2, &rename_map,
-                )
-            })
+            .map_init(
+                alpha::AlphaTokenizer::new,
+                |tokenizer, &(i1, i2, similarity)| {
+                    diff_matched_pair(
+                        tokenizer,
+                        &decls1[i1],
+                        &decls2[i2],
+                        similarity,
+                        &lines1,
+                        &lines2,
+                        &rename_map,
+                        &pairing,
+                    )
+                },
+            )
             .collect();
 
         let mut unchanged_count = 0usize;
@@ -485,6 +497,216 @@ impl ParallelMatcherV2 {
 
 // Helper functions
 
+/// How many lines from the referencing declaration a free reference looks for
+/// the declaration it names, and how near the Phase A partner that contradicts
+/// it has to sit. A minified bundle concatenates scopes that reuse the same
+/// short names at top level, and many bindings (`var x;` assigned later, `let`,
+/// `const`) are never extracted, so a same-named declaration far away is more
+/// often a stranger than the binding. Past this distance a reference is left
+/// to plain alpha-equivalence.
+const NEIGHBOURHOOD_LINES: usize = 200;
+
+/// The declarations Phase A matched, by identity rather than by name, so that
+/// a free reference can be held to the pairing. Unlike `rename_map` it also
+/// holds the pairs whose name did not change.
+struct TopLevelPairing<'a> {
+    old: TopLevelSide<'a>,
+    new: TopLevelSide<'a>,
+}
+
+/// One build's declarations, indexed for resolving a name near a given
+/// declaration, with each one's Phase A partner on the other side.
+struct TopLevelSide<'a> {
+    decls: &'a [DeclarationData],
+    lines: &'a [&'a str],
+    /// Declaration indices per name, in line order.
+    by_name: HashMap<&'a str, Vec<usize>>,
+    partner: Vec<Option<usize>>,
+}
+
+impl<'a> TopLevelPairing<'a> {
+    fn new(
+        matches: &[(usize, usize)],
+        decls1: &'a [DeclarationData],
+        decls2: &'a [DeclarationData],
+        lines1: &'a [&'a str],
+        lines2: &'a [&'a str],
+    ) -> Self {
+        let mut old = TopLevelSide::new(decls1, lines1);
+        let mut new = TopLevelSide::new(decls2, lines2);
+
+        for &(i1, i2) in matches {
+            old.partner[i1] = Some(i2);
+            new.partner[i2] = Some(i1);
+        }
+
+        Self { old, new }
+    }
+
+    /// The indices of the free references in a same-shape pair that now name
+    /// a different declaration than the pairing says (see [`Self::is_repointed`]).
+    fn repointed_refs(
+        &self,
+        tokenizer: &mut alpha::AlphaTokenizer,
+        t1: &alpha::AlphaTokens,
+        t2: &alpha::AlphaTokens,
+        decl1: &DeclarationData,
+        decl2: &DeclarationData,
+    ) -> Vec<u32> {
+        alpha::free_renames(t1, t2)
+            .filter(|&(_, old_name, new_name)| {
+                self.is_repointed(tokenizer, old_name, new_name, decl1, decl2)
+            })
+            .map(|(index, _, _)| index)
+            .collect()
+    }
+
+    /// Whether the reference read as `old_name` in `decl1` and `new_name` in
+    /// `decl2` changed what it points at. Each name stands for every
+    /// declaration of that name near its pair on its own side, since nearness
+    /// alone cannot tell a reused short name's binding from a neighbour. The
+    /// reference is re-pointed only when no old target was matched to a new
+    /// one, a contradicting partner sits near the pair (so the pairing has a
+    /// local answer that differs), and no old target is identical to a new one
+    /// up to renaming, a look-alike Phase A could have cross-paired. String
+    /// text counts here: siblings differing only in their strings are exactly
+    /// the targets a swapped reference trades between. A name with no
+    /// declaration nearby (removed, or bound where nothing is extracted)
+    /// contradicts nothing.
+    fn is_repointed(
+        &self,
+        tokenizer: &mut alpha::AlphaTokenizer,
+        old_name: &str,
+        new_name: &str,
+        decl1: &DeclarationData,
+        decl2: &DeclarationData,
+    ) -> bool {
+        let old_targets = self.old.near(old_name, decl1);
+        let new_targets = self.new.near(new_name, decl2);
+
+        if old_targets.is_empty() || new_targets.is_empty() {
+            return false;
+        }
+
+        let is_paired = old_targets
+            .iter()
+            .filter_map(|&i1| self.old.partner[i1])
+            .any(|i2| new_targets.contains(&i2));
+
+        if is_paired {
+            return false;
+        }
+
+        let is_contradicted_nearby = self.old.has_partner_near(old_targets, &self.new, decl2)
+            || self.new.has_partner_near(new_targets, &self.old, decl1);
+
+        if !is_contradicted_nearby {
+            return false;
+        }
+
+        let old_shapes = self.old.shapes(tokenizer, old_targets);
+        let new_shapes = self.new.shapes(tokenizer, new_targets);
+        let is_look_alike = old_shapes
+            .iter()
+            .any(|a| new_shapes.iter().any(|b| alpha::alpha_equal(a, b)));
+
+        !is_look_alike
+    }
+}
+
+impl<'a> TopLevelSide<'a> {
+    fn new(decls: &'a [DeclarationData], lines: &'a [&'a str]) -> Self {
+        let mut by_name: HashMap<&'a str, Vec<usize>> = HashMap::new();
+
+        for (index, decl) in decls.iter().enumerate() {
+            by_name.entry(decl.name.as_str()).or_default().push(index);
+        }
+
+        for indices in by_name.values_mut() {
+            indices.sort_by_key(|&index| decls[index].line);
+        }
+
+        Self {
+            decls,
+            lines,
+            by_name,
+            partner: vec![None; decls.len()],
+        }
+    }
+
+    /// The declarations named `name` within [`NEIGHBOURHOOD_LINES`] of
+    /// `from`, in line order. Top-level declarations do not overlap, so their
+    /// end lines rise with their start lines and two binary searches bound
+    /// the window.
+    fn near(&self, name: &str, from: &DeclarationData) -> &[usize] {
+        let Some(candidates) = self.by_name.get(name) else {
+            return &[];
+        };
+        let window_start = from.line.saturating_sub(NEIGHBOURHOOD_LINES);
+        let window_end = from.end_line + NEIGHBOURHOOD_LINES;
+        let start = candidates.partition_point(|&index| self.decls[index].end_line < window_start);
+        let end = candidates.partition_point(|&index| self.decls[index].line <= window_end);
+
+        // Overlapping spans would break the ordering; an empty window beats a panic.
+        &candidates[start..end.max(start)]
+    }
+
+    fn is_near(&self, index: usize, from: &DeclarationData) -> bool {
+        line_gap(&self.decls[index], from) <= NEIGHBOURHOOD_LINES
+    }
+
+    /// Whether any of `targets` was matched to a declaration on the `other`
+    /// side within [`NEIGHBOURHOOD_LINES`] of `from`.
+    fn has_partner_near(
+        &self,
+        targets: &[usize],
+        other: &TopLevelSide,
+        from: &DeclarationData,
+    ) -> bool {
+        targets
+            .iter()
+            .any(|&index| self.partner[index].is_some_and(|p| other.is_near(p, from)))
+    }
+
+    /// The declarator text of each of `targets`, tokenized for comparing
+    /// declarations by shape.
+    fn shapes(
+        &self,
+        tokenizer: &mut alpha::AlphaTokenizer,
+        targets: &[usize],
+    ) -> Vec<alpha::AlphaTokens> {
+        targets
+            .iter()
+            .map(|&index| tokenizer.tokenize(&self.declarator_text(index)))
+            .collect()
+    }
+
+    /// The source of declaration `index` without the `var`/`let`/`const` a
+    /// first declarator carries or the `,`/`;` that ends it, so two
+    /// declarators compare by what they declare, not by where they sit in
+    /// their statement.
+    fn declarator_text(&self, index: usize) -> String {
+        let decl = &self.decls[index];
+        let source = super::extract_source_range(self.lines, decl.line, decl.end_line);
+        let text = source.trim();
+        let text = ["var ", "let ", "const "]
+            .iter()
+            .find_map(|keyword| text.strip_prefix(keyword))
+            .unwrap_or(text);
+
+        text.trim_end_matches([',', ';']).to_string()
+    }
+}
+
+/// Lines between two declarations' spans, zero when they overlap.
+fn line_gap(decl: &DeclarationData, from: &DeclarationData) -> usize {
+    if decl.end_line < from.line {
+        from.line - decl.end_line
+    } else {
+        decl.line.saturating_sub(from.end_line)
+    }
+}
+
 /// How one matched pair counts toward the Phase B summary line.
 enum PairTally {
     /// Source could not be extracted and the names agree: no change, not counted.
@@ -495,6 +717,7 @@ enum PairTally {
 }
 
 /// Classify and diff one matched pair: the per-pair body of Phase B.
+#[allow(clippy::too_many_arguments)]
 fn diff_matched_pair(
     tokenizer: &mut alpha::AlphaTokenizer,
     decl1: &DeclarationData,
@@ -503,6 +726,7 @@ fn diff_matched_pair(
     lines1: &[&str],
     lines2: &[&str],
     rename_map: &HashMap<String, String>,
+    pairing: &TopLevelPairing,
 ) -> (PairTally, Option<Change>) {
     use super::StructuralDiff;
 
@@ -563,20 +787,40 @@ fn diff_matched_pair(
         // Token-level alpha-equivalence: a consistent rename (top-level or
         // function-local, any identifier length) compares equal, and masking
         // string content separates string-only edits from structural ones.
+        // The bijection it finds is its own, though, so free references to
+        // top-level declarations are also held to the Phase A pairing: a
+        // table re-pointed at different declarations is not a rename. A bare
+        // alias (`var a = b;`) is exempt: it has no body or strings for Phase
+        // A to pair it by, so a reference that disagrees with the pairing
+        // there says the alias pair is a guess, not that the code changed.
         let t1 = tokenizer.tokenize(&src1);
         let t2 = tokenizer.tokenize(&src2);
+        let is_same_shape = alpha::alpha_equal_masked(&t1, &t2);
+        let repointed = if is_same_shape && !t1.is_bare_alias() {
+            pairing.repointed_refs(tokenizer, &t1, &t2, decl1, decl2)
+        } else {
+            Vec::new()
+        };
+        let is_rename_only = is_same_shape && repointed.is_empty();
 
-        if alpha::alpha_equal(&t1, &t2) {
+        if is_rename_only && alpha::alpha_equal(&t1, &t2) {
             (DiffClassification::Unchanged, String::new())
         } else {
-            let classification = if alpha::alpha_equal_masked(&t1, &t2) {
+            let classification = if is_rename_only {
                 DiffClassification::StringOnly
             } else {
                 DiffClassification::Structural
             };
-            let display_diff = StructuralDiff::generate_alpha_display_diff(
-                &src1, &src2, &t1.norm_lines(), &t2.norm_lines(), 3,
-            );
+            let (norm1, norm2) = if repointed.is_empty() {
+                (t1.norm_lines(), t2.norm_lines())
+            } else {
+                (
+                    t1.norm_lines_flagging(&repointed, '-'),
+                    t2.norm_lines_flagging(&repointed, '+'),
+                )
+            };
+            let display_diff =
+                StructuralDiff::generate_alpha_display_diff(&src1, &src2, &norm1, &norm2, 3);
 
             (classification, display_diff)
         }
@@ -757,5 +1001,507 @@ fn kind_to_string(kind: &DeclarationKind) -> &'static str {
         DeclarationKind::Variable => "variable",
         DeclarationKind::Import => "import",
         DeclarationKind::Export => "export",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::StructuralDiff;
+
+    /// A base table, an override that spreads it and changes one key, and a
+    /// dispatch table pointing its default row at the override and one model
+    /// row at the base.
+    const OLD_TABLES: &str = r#"var pick = (cell) => ({ cell: cell, mode: "typed" }),
+  tierLow = { cell: "low", mode: "typed" },
+  baseTable = {
+    low: tierLow,
+    medium: { ...pick("alpha-min"), measured: !0 },
+    high: { ...pick("alpha-min"), measured: !0 },
+  },
+  overrideTable = { ...baseTable, high: { ...pick("beta-high"), measured: !0 } },
+  dispatchTable = {
+    default: overrideTable,
+    "model-y": { low: pick("y-low"), high: pick("y-high") },
+    "model-x": baseTable,
+  };
+"#;
+
+    /// The next build: the base is renamed and its strings edited, the old
+    /// override is gone, a new override is added, and the dispatch table is
+    /// re-pointed (default at the base, the model row at the new override).
+    /// Token for token the dispatch table is a pure rename of the old one.
+    const REPOINTED_TABLES: &str = r#"var choose = (cell) => ({ cell: cell, mode: "typed" }),
+  lowTier = { cell: "low", mode: "typed" },
+  rootTable = {
+    low: lowTier,
+    medium: { ...choose("beta-high"), measured: !0 },
+    high: { ...choose("beta-high"), measured: !0 },
+  },
+  patchTable = {
+    ...rootTable,
+    medium: { ...choose("alpha-min"), measured: !0 },
+    high: { ...choose("alpha-min"), measured: !0 },
+  },
+  routeTable = {
+    default: rootTable,
+    "model-y": { low: choose("y-low"), high: choose("y-high") },
+    "model-x": patchTable,
+  };
+"#;
+
+    /// OLD_TABLES with every name changed and nothing else.
+    const RENAMED_TABLES: &str = r#"var choose = (cell) => ({ cell: cell, mode: "typed" }),
+  lowTier = { cell: "low", mode: "typed" },
+  rootTable = {
+    low: lowTier,
+    medium: { ...choose("alpha-min"), measured: !0 },
+    high: { ...choose("alpha-min"), measured: !0 },
+  },
+  patchTable = { ...rootTable, high: { ...choose("beta-high"), measured: !0 } },
+  routeTable = {
+    default: patchTable,
+    "model-y": { low: choose("y-low"), high: choose("y-high") },
+    "model-x": rootTable,
+  };
+"#;
+
+    /// RENAMED_TABLES with the default and model rows swapped.
+    const SWAPPED_TABLES: &str = r#"var choose = (cell) => ({ cell: cell, mode: "typed" }),
+  lowTier = { cell: "low", mode: "typed" },
+  rootTable = {
+    low: lowTier,
+    medium: { ...choose("alpha-min"), measured: !0 },
+    high: { ...choose("alpha-min"), measured: !0 },
+  },
+  patchTable = { ...rootTable, high: { ...choose("beta-high"), measured: !0 } },
+  routeTable = {
+    default: rootTable,
+    "model-y": { low: choose("y-low"), high: choose("y-high") },
+    "model-x": patchTable,
+  };
+"#;
+
+    const ALL_RENAMED: &[(&str, &str)] = &[
+        ("pick", "choose"),
+        ("tierLow", "lowTier"),
+        ("baseTable", "rootTable"),
+        ("overrideTable", "patchTable"),
+        ("dispatchTable", "routeTable"),
+    ];
+
+    /// Phase A's outcome for OLD_TABLES -> REPOINTED_TABLES: the old override
+    /// was removed and the new one added, so neither is paired.
+    const REPOINTED_PAIRS: &[(&str, &str)] = &[
+        ("pick", "choose"),
+        ("tierLow", "lowTier"),
+        ("baseTable", "rootTable"),
+        ("dispatchTable", "routeTable"),
+    ];
+
+    fn declarations(src: &str) -> Vec<DeclarationData> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(tree_sitter_javascript::language())
+            .expect("tree-sitter-javascript language must load");
+        let tree = parser.parse(src, None).expect("fixture parses");
+
+        StructuralDiff::new()
+            .extract_declarations(tree.root_node(), src)
+            .into_iter()
+            .map(|decl| decl.into_data())
+            .collect()
+    }
+
+    fn index_of(decls: &[DeclarationData], name: &str) -> usize {
+        decls
+            .iter()
+            .position(|decl| decl.name == name)
+            .unwrap_or_else(|| panic!("fixture declares '{name}'"))
+    }
+
+    /// A fixture declaration by name and occurrence (0 for the first
+    /// declaration of that name), for fixtures that declare a name twice.
+    type At = (&'static str, usize);
+
+    fn index_at(decls: &[DeclarationData], (name, nth): At) -> usize {
+        decls
+            .iter()
+            .enumerate()
+            .filter(|(_, decl)| decl.name == name)
+            .nth(nth)
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| panic!("fixture declares '{name}' more than {nth} times"))
+    }
+
+    /// Phase B for the pair `old_name -> new_name`, with Phase A's outcome
+    /// given as `pairs` instead of left to the matcher's scoring.
+    fn diff_pair(
+        old_src: &str,
+        new_src: &str,
+        pairs: &[(&str, &str)],
+        old_name: &str,
+        new_name: &str,
+    ) -> (PairTally, Option<Change>) {
+        let decls1 = declarations(old_src);
+        let decls2 = declarations(new_src);
+        let matches: Vec<(usize, usize)> = pairs
+            .iter()
+            .map(|&(old, new)| (index_of(&decls1, old), index_of(&decls2, new)))
+            .collect();
+        let pair = (index_of(&decls1, old_name), index_of(&decls2, new_name));
+
+        diff_indexed(old_src, new_src, &decls1, &decls2, &matches, pair)
+    }
+
+    /// [`diff_pair`] with every declaration named by its occurrence as well.
+    fn diff_at(
+        old_src: &str,
+        new_src: &str,
+        pairs: &[(At, At)],
+        old: At,
+        new: At,
+    ) -> (PairTally, Option<Change>) {
+        let decls1 = declarations(old_src);
+        let decls2 = declarations(new_src);
+        let matches: Vec<(usize, usize)> = pairs
+            .iter()
+            .map(|&(old_at, new_at)| (index_at(&decls1, old_at), index_at(&decls2, new_at)))
+            .collect();
+        let pair = (index_at(&decls1, old), index_at(&decls2, new));
+
+        diff_indexed(old_src, new_src, &decls1, &decls2, &matches, pair)
+    }
+
+    /// Phase B for the declarations at `(i1, i2)`, given Phase A's `matches`,
+    /// with the rename map built the way Phase A builds it.
+    fn diff_indexed(
+        old_src: &str,
+        new_src: &str,
+        decls1: &[DeclarationData],
+        decls2: &[DeclarationData],
+        matches: &[(usize, usize)],
+        (i1, i2): (usize, usize),
+    ) -> (PairTally, Option<Change>) {
+        let rename_map: HashMap<String, String> = matches
+            .iter()
+            .map(|&(m1, m2)| (&decls1[m1].name, &decls2[m2].name))
+            .filter(|(old, new)| old != new)
+            .map(|(old, new)| (new.clone(), old.clone()))
+            .collect();
+        let lines1: Vec<&str> = old_src.lines().collect();
+        let lines2: Vec<&str> = new_src.lines().collect();
+        let pairing = TopLevelPairing::new(matches, decls1, decls2, &lines1, &lines2);
+
+        diff_matched_pair(
+            &mut alpha::AlphaTokenizer::new(),
+            &decls1[i1],
+            &decls2[i2],
+            1.0,
+            &lines1,
+            &lines2,
+            &rename_map,
+            &pairing,
+        )
+    }
+
+    #[test]
+    fn a_table_repointed_at_other_declarations_is_structural() {
+        // The dispatch table now reads its default row from the base and its
+        // model row from the new override, which a local bijection would
+        // excuse as a rename (old override <-> base, base <-> new override).
+        let (tally, change) = diff_pair(
+            OLD_TABLES,
+            REPOINTED_TABLES,
+            REPOINTED_PAIRS,
+            "dispatchTable",
+            "routeTable",
+        );
+        let change = change.expect("a re-pointed table is reported");
+
+        assert!(matches!(tally, PairTally::Structural));
+        assert_eq!(change.classification, Some(DiffClassification::Structural));
+        assert!(
+            change.display_diff.contains(r#""model-x": patchTable"#),
+            "display diff shows the re-pointed model row:\n{}",
+            change.display_diff
+        );
+        assert!(
+            change.display_diff.contains("default: rootTable"),
+            "display diff shows the re-pointed default row:\n{}",
+            change.display_diff
+        );
+    }
+
+    #[test]
+    fn the_renamed_base_keeps_its_string_only_classification() {
+        // Its own references (the low tier, the helper) follow the pairing,
+        // so only its string edit is reported.
+        let (tally, change) = diff_pair(
+            OLD_TABLES,
+            REPOINTED_TABLES,
+            REPOINTED_PAIRS,
+            "baseTable",
+            "rootTable",
+        );
+
+        assert!(matches!(tally, PairTally::StringOnly));
+        assert_eq!(
+            change.and_then(|c| c.classification),
+            Some(DiffClassification::StringOnly)
+        );
+    }
+
+    #[test]
+    fn a_table_whose_references_follow_the_pairing_is_unchanged() {
+        let (tally, change) = diff_pair(
+            OLD_TABLES,
+            RENAMED_TABLES,
+            ALL_RENAMED,
+            "dispatchTable",
+            "routeTable",
+        );
+
+        assert!(matches!(tally, PairTally::Unchanged));
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn swapping_two_paired_references_is_structural() {
+        // Both targets are paired, each with the other's successor.
+        let (tally, change) = diff_pair(
+            OLD_TABLES,
+            SWAPPED_TABLES,
+            ALL_RENAMED,
+            "dispatchTable",
+            "routeTable",
+        );
+        let change = change.expect("a swap is reported");
+
+        assert!(matches!(tally, PairTally::Structural));
+        assert!(change.display_diff.contains(r#""model-x": patchTable"#));
+    }
+
+    #[test]
+    fn a_parameter_named_like_a_top_level_declaration_keeps_alpha_equivalence() {
+        // `baseTable` is a parameter here, not the top-level table, so its
+        // rename to `patchTable` is local even though both names are paired
+        // with other declarations.
+        let old = "var baseTable = { low: 1 },\n  overrideTable = { low: 2 },\n  lookup = (baseTable) => baseTable.low;\n";
+        let new = "var rootTable = { low: 1 },\n  patchTable = { low: 2 },\n  find = (patchTable) => patchTable.low;\n";
+        let pairs = [
+            ("baseTable", "rootTable"),
+            ("overrideTable", "patchTable"),
+            ("lookup", "find"),
+        ];
+
+        let (tally, change) = diff_pair(old, new, &pairs, "lookup", "find");
+
+        assert!(matches!(tally, PairTally::Unchanged));
+        assert!(change.is_none());
+    }
+
+    /// Two regions that reuse the same short names at top level, as
+    /// concatenated scopes in a minified bundle do, split by a blank line
+    /// that [`spread`] widens past the neighbourhood. The first holds a base,
+    /// an override and a table; the second, three helpers.
+    const OLD_REGIONS: &str = r#"var e = { low: "a", high: "b" },
+  f = { ...e, high: "c" },
+  m = {
+    default: f,
+    "model-x": e,
+  };
+
+var e = (n) => n + 1,
+  f = (n) => n * 2,
+  m = (n) => f(e(n));
+"#;
+
+    /// The next build: the first region's override is replaced and its table
+    /// re-pointed (default at the base, the model row at the new override);
+    /// the second region is renamed and nothing else.
+    const REPOINTED_REGIONS: &str = r#"var g = { low: "a", high: "c" },
+  x = { ...g, high: "b" },
+  k = {
+    default: g,
+    "model-x": x,
+  };
+
+var x = (n) => n + 1,
+  g = (n) => n * 2,
+  k = (n) => g(x(n));
+"#;
+
+    /// Phase A's outcome for OLD_REGIONS -> REPOINTED_REGIONS: the first
+    /// region's old override was removed and its new one added.
+    const REGION_PAIRS: &[(At, At)] = &[
+        (("e", 0), ("g", 0)),
+        (("m", 0), ("k", 0)),
+        (("e", 1), ("x", 1)),
+        (("f", 1), ("g", 1)),
+        (("m", 1), ("k", 1)),
+    ];
+
+    /// `regions` with the blank line between its regions widened so that
+    /// neither region is within the other's neighbourhood. Same-named
+    /// declarations inside one neighbourhood are deliberately read as
+    /// consistent, so the regions have to sit apart, as they do in a bundle.
+    fn spread(regions: &str) -> String {
+        regions.replace("\n\n", &"\n".repeat(NEIGHBOURHOOD_LINES + 50))
+    }
+
+    #[test]
+    fn a_table_repointed_among_names_reused_elsewhere_is_structural() {
+        // Every name the table reads is declared again in the other region,
+        // so the check has to follow each reference to its own neighbour.
+        let (tally, change) = diff_at(
+            &spread(OLD_REGIONS),
+            &spread(REPOINTED_REGIONS),
+            REGION_PAIRS,
+            ("m", 0),
+            ("k", 0),
+        );
+        let change = change.expect("a re-pointed table is reported");
+
+        assert!(matches!(tally, PairTally::Structural));
+        assert!(
+            change.display_diff.contains(r#""model-x": x"#),
+            "display diff shows the re-pointed model row:\n{}",
+            change.display_diff
+        );
+        assert!(
+            change.display_diff.contains("default: g"),
+            "display diff shows the re-pointed default row:\n{}",
+            change.display_diff
+        );
+    }
+
+    #[test]
+    fn a_renamed_region_stays_unchanged_beside_a_repointed_one() {
+        // The helper reads the second region's `f` and `e`, which follow the
+        // pairing; the first region's same-named declarations do not, and must
+        // not be taken for them.
+        let (tally, change) = diff_at(
+            &spread(OLD_REGIONS),
+            &spread(REPOINTED_REGIONS),
+            REGION_PAIRS,
+            ("m", 1),
+            ("k", 1),
+        );
+
+        assert!(matches!(tally, PairTally::Unchanged));
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn a_reference_moved_between_cross_paired_look_alikes_is_unchanged() {
+        // Phase A paired the two factories by position, each with the other's
+        // successor, but they differ only in a string, so the table's
+        // references still name the same code.
+        let old = r#"var u = () => ({ id: "one" }),
+  v = () => ({ id: "two" }),
+  w = { first: u, second: v };
+"#;
+        let new = r#"var z = () => ({ id: "two" }),
+  s = () => ({ id: "one" }),
+  y = { first: s, second: z };
+"#;
+        let pairs = [("u", "z"), ("v", "s"), ("w", "y")];
+
+        let (tally, change) = diff_pair(old, new, &pairs, "w", "y");
+
+        assert!(matches!(tally, PairTally::Unchanged));
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn a_reference_to_a_name_declared_twice_nearby_follows_either_declaration() {
+        // The next build declares `store` twice: the function the caller
+        // reads, and a class just below the caller. The class is the nearer
+        // of the two, but the function is the old one's partner, so the
+        // caller is a pure rename.
+        let old = r#"function loadStore() {
+  return { kind: "store" };
+}
+function pad(n) {
+  const out = n;
+  const twice = out * 2;
+  const thrice = out * 3;
+  return twice + thrice;
+}
+function start() {
+  return loadStore().open();
+}
+class Shelf {
+  open() {}
+}
+"#;
+        let new = r#"function store() {
+  return { kind: "store" };
+}
+function pad(n) {
+  const out = n;
+  const twice = out * 2;
+  const thrice = out * 3;
+  return twice + thrice;
+}
+function begin() {
+  return store().open();
+}
+class store {
+  open() {}
+}
+"#;
+        let pairs = [
+            (("loadStore", 0), ("store", 0)),
+            (("pad", 0), ("pad", 0)),
+            (("start", 0), ("begin", 0)),
+            (("Shelf", 0), ("store", 1)),
+        ];
+
+        let (tally, change) = diff_at(old, new, &pairs, ("start", 0), ("begin", 0));
+
+        assert!(matches!(tally, PairTally::Unchanged));
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn a_bare_alias_is_not_held_to_the_pairing() {
+        // The alias reads a different table's successor than the pairing
+        // says, but an alias has nothing of its own for Phase A to pair it
+        // by, so the disagreement indicts the alias pair, not the code.
+        let old = "var small = { size: 1 },\n  other = { size: 2 };\nvar alias = small;\n";
+        let new = "var tiny = { size: 1 },\n  large = { size: 2 };\nvar link = large;\n";
+        let pairs = [("small", "tiny"), ("other", "large"), ("alias", "link")];
+
+        let (tally, change) = diff_pair(old, new, &pairs, "alias", "link");
+
+        assert!(matches!(tally, PairTally::Unchanged));
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn a_swap_between_string_only_siblings_is_structural() {
+        // The two rows' targets differ only in a string, but they are still
+        // different code: swapping which row reads which is a real change.
+        let old = r#"var alpha = { medium: label("x") },
+  beta = { medium: label("y") },
+  table = { default: alpha, "m": beta };
+"#;
+        let new = r#"var first = { medium: label("x") },
+  second = { medium: label("y") },
+  routes = { default: second, "m": first };
+"#;
+        let pairs = [("alpha", "first"), ("beta", "second"), ("table", "routes")];
+
+        let (tally, change) = diff_pair(old, new, &pairs, "table", "routes");
+        let change = change.expect("a swap is reported");
+
+        assert!(matches!(tally, PairTally::Structural));
+        assert!(
+            change.display_diff.contains("default: second"),
+            "display diff shows the swapped default row:\n{}",
+            change.display_diff
+        );
     }
 }
