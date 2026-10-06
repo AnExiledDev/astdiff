@@ -431,18 +431,21 @@ impl ParallelMatcherV2 {
         // The indexed collect keeps match order, so changes come out as they did serially.
         let outcomes: Vec<(PairTally, Option<Change>)> = match_data
             .par_iter()
-            .map_init(alpha::AlphaTokenizer::new, |tokenizer, &(i1, i2, similarity)| {
-                diff_matched_pair(
-                    tokenizer,
-                    &decls1[i1],
-                    &decls2[i2],
-                    similarity,
-                    &lines1,
-                    &lines2,
-                    &rename_map,
-                    &pairing,
-                )
-            })
+            .map_init(
+                alpha::AlphaTokenizer::new,
+                |tokenizer, &(i1, i2, similarity)| {
+                    diff_matched_pair(
+                        tokenizer,
+                        &decls1[i1],
+                        &decls2[i2],
+                        similarity,
+                        &lines1,
+                        &lines2,
+                        &rename_map,
+                        &pairing,
+                    )
+                },
+            )
             .collect();
 
         let mut unchanged_count = 0usize;
@@ -1489,11 +1492,7 @@ class store {
   second = { medium: label("y") },
   routes = { default: second, "m": first };
 "#;
-        let pairs = [
-            ("alpha", "first"),
-            ("beta", "second"),
-            ("table", "routes"),
-        ];
+        let pairs = [("alpha", "first"), ("beta", "second"), ("table", "routes")];
 
         let (tally, change) = diff_pair(old, new, &pairs, "table", "routes");
         let change = change.expect("a swap is reported");
