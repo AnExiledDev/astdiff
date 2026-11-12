@@ -60,12 +60,9 @@ struct Decl2Probe {
     has_flat_signature: bool,
 }
 
-/// A pair that survived LSH filtering.
+/// A pair that survived LSH filtering, on its way to being scored.
 ///
-/// Indices are u32 because this list is the largest live allocation in the tool
-/// (50M+ entries on a 34 MB bundle) and no input has come close to 4 billion
-/// declarations. The old struct also carried the LSH score, which nothing ever
-/// read; dropping it and narrowing the indices takes the entry from 32 to 12 bytes.
+/// Never stored in bulk: scan_and_score scores each one as soon as it is found.
 #[derive(Debug, Clone)]
 pub struct CandidateMatch {
     pub i1: u32,
@@ -84,15 +81,11 @@ pub struct SimilarityResult {
 
 pub struct ParallelMatcherV2 {
     use_fingerprints: bool,
-    batch_size: usize,
 }
 
 impl ParallelMatcherV2 {
     pub fn new(use_fingerprints: bool) -> Self {
-        Self {
-            use_fingerprints,
-            batch_size: 1000, // Process LSH in batches of 1000
-        }
+        Self { use_fingerprints }
     }
     
     pub fn match_declarations(
@@ -106,27 +99,12 @@ impl ParallelMatcherV2 {
     ) -> (Vec<(usize, usize)>, Vec<Change>, HashMap<String, String>) {
         use super::profiling::Timer;
 
-        // Steps 1+2: generate candidate pairs and LSH-filter them in one pass, so
-        // only survivors are ever stored (see build_and_filter_candidates).
-        let lsh_candidates = {
-            let _timer = Timer::new("build_and_filter_candidates");
-            self.build_and_filter_candidates(decls1, decls2)
-        };
-
-        eprintln!("LSH filtering reduced to {} candidates", lsh_candidates.len());
-
-        // Step 3: Parallel full similarity calculation for remaining candidates
+        // Steps 1-3: generate candidate pairs, LSH-filter them and score the
+        // survivors in one pass, so only pairs that clear the similarity threshold
+        // are ever stored (see scan_and_score).
         let similarity_results = {
-            let _timer = Timer::new("parallel_full_similarity");
-            self.parallel_full_similarity(
-                &lsh_candidates,
-                decls1,
-                decls2,
-                source1,
-                source2,
-                scorer,
-                &calculate_similarity,
-            )
+            let _timer = Timer::new("scan_and_score");
+            self.scan_and_score(decls1, decls2, source1, source2, scorer, &calculate_similarity)
         };
 
         // Step 4: Resolve best matches + normalize/diff all pairs
@@ -137,19 +115,20 @@ impl ParallelMatcherV2 {
 
         (matches, changes, rename_map)
     }
-    
-    /// Generate the candidate pairs and LSH-filter them in a single pass.
+
+    /// Generate the candidate pairs, LSH-filter them and score the survivors in a
+    /// single pass.
     ///
-    /// This used to be two steps: materialize every (i1, i2) pair whose sizes and
-    /// kinds were compatible, then filter that list down. On a 34 MB bundle the
-    /// intermediate list held 230 million pairs, 3.7 GB, and it stayed alive while
-    /// the filtered list was built next to it. Worse, a Vec that large grows by
-    /// doubling, so the last reallocation needs the old and new buffers resident at
-    /// the same time. That transient spike is what aborted the process on hosts
-    /// where the memory was not there.
-    ///
-    /// Testing each pair as it is generated means only the survivors are ever
-    /// stored, which is roughly a fifth of the pairs on real input.
+    /// This used to be three steps, and each one stored its whole output before the
+    /// next began. First every (i1, i2) pair whose sizes and kinds were compatible
+    /// was materialized and then filtered; that list was 230 million pairs, 3.7 GB,
+    /// on a 34 MB bundle, so the filter moved into the scan. Then the LSH survivors
+    /// were stored and scored in a second pass. The survivor count grows with the
+    /// square of the declaration count, not with the bundle size: 32 million on a
+    /// 30 MB pair, 350 million (4.2 GB at 12 bytes each) on 2.1.322 -> 2.1.323 at
+    /// 59 -> 66 MB, which is what pushed the process past the box's memory. Scoring
+    /// each pair as the scan finds it means only the pairs that clear the
+    /// similarity threshold are ever stored.
     ///
     /// The scan itself reads a flat copy of the decls2 signatures and a compact side
     /// table, both laid out in the same size order the window walks, so a probe costs a
@@ -159,7 +138,15 @@ impl ParallelMatcherV2 {
     /// Output order is unchanged (i1 ascending, then decls2 in size order):
     /// resolve_best_matches sorts these by similarity with a stable sort, so the
     /// order here decides tie-breaks and therefore the final diff.
-    fn build_and_filter_candidates(&self, decls1: &[DeclarationData], decls2: &[DeclarationData]) -> Vec<CandidateMatch> {
+    fn scan_and_score(
+        &self,
+        decls1: &[DeclarationData],
+        decls2: &[DeclarationData],
+        source1: &str,
+        source2: &str,
+        scorer: Option<&RarityScorer>,
+        calculate_similarity: &(impl Fn(&DeclarationData, &DeclarationData, &str, &str) -> f64 + Sync),
+    ) -> Vec<SimilarityResult> {
         // Sort declarations by size for efficient window search
         let mut sorted2: Vec<(usize, usize)> = decls2.iter()
             .enumerate()
@@ -217,9 +204,10 @@ impl ParallelMatcherV2 {
         }
 
         let examined = AtomicUsize::new(0);
+        let candidates = AtomicUsize::new(0);
         let last_update = Mutex::new(Instant::now());
 
-        let results: Vec<CandidateMatch> = decls1.par_iter()
+        let results: Vec<SimilarityResult> = decls1.par_iter()
             .enumerate()
             .flat_map_iter(|(i1, decl1)| {
                 let min_size = ((decl1.size as f64) * 0.5).max(1.0) as usize;
@@ -231,6 +219,7 @@ impl ParallelMatcherV2 {
 
                 let mut local_results = Vec::new();
                 let mut local_examined = 0usize;
+                let mut local_candidates = 0usize;
 
                 for idx in start_idx..probes.len() {
                     let probe = &probes[idx];
@@ -247,36 +236,38 @@ impl ParallelMatcherV2 {
                     // Always include pairs with matching names - they're almost certainly
                     // the same function/variable and need to be compared for string diffs
                     // even if structural similarity is low (e.g., template string content changed)
-                    if name_id1 == probe.name_id {
-                        local_results.push(CandidateMatch {
-                            i1: i1 as u32,
-                            i2: probe.i2,
-                            name_match: true,
-                        });
-                        continue;
+                    let name_match = name_id1 == probe.name_id;
+
+                    if !name_match {
+                        let sig2: &[u64] = if probe.has_flat_signature {
+                            &flat_signatures[idx * MINHASH_LANES..(idx + 1) * MINHASH_LANES]
+                        } else {
+                            &decls2[probe.i2 as usize].minhash_signature
+                        };
+
+                        if !passes_lsh_gate(&decl1.minhash_signature, sig2) {
+                            continue;
+                        }
                     }
 
-                    let sig2: &[u64] = if probe.has_flat_signature {
-                        &flat_signatures[idx * MINHASH_LANES..(idx + 1) * MINHASH_LANES]
-                    } else {
-                        &decls2[probe.i2 as usize].minhash_signature
-                    };
+                    local_candidates += 1;
 
-                    if passes_lsh_gate(&decl1.minhash_signature, sig2) {
-                        local_results.push(CandidateMatch {
-                            i1: i1 as u32,
-                            i2: probe.i2,
-                            name_match: false,
-                        });
+                    let candidate = CandidateMatch { i1: i1 as u32, i2: probe.i2, name_match };
+
+                    if let Some(result) = self.score_candidate(
+                        &candidate, decls1, decls2, source1, source2, scorer, calculate_similarity,
+                    ) {
+                        local_results.push(result);
                     }
                 }
 
                 // Report progress every second
                 let done = examined.fetch_add(local_examined, Ordering::Relaxed) + local_examined;
+                candidates.fetch_add(local_candidates, Ordering::Relaxed);
 
                 if let Ok(mut last) = last_update.try_lock() {
                     if last.elapsed() >= Duration::from_secs(1) {
-                        eprint!("\r  LSH filtering: {} pairs examined", done);
+                        eprint!("\r  LSH filtering and scoring: {} pairs examined", done);
                         *last = Instant::now();
                     }
                 }
@@ -286,97 +277,79 @@ impl ParallelMatcherV2 {
             .collect();
 
         // Clear the progress line with a final update
-        eprintln!("\r  LSH filtering: {} pairs examined - Complete", examined.load(Ordering::Relaxed));
+        eprintln!("\r  LSH filtering and scoring: {} pairs examined - Complete", examined.load(Ordering::Relaxed));
+        eprintln!(
+            "LSH filtering reduced to {} candidates, {} cleared the similarity threshold",
+            candidates.load(Ordering::Relaxed),
+            results.len(),
+        );
 
         results
     }
-    
-    fn parallel_full_similarity(
+
+    /// Score one LSH survivor, or None when it misses the similarity threshold.
+    ///
+    /// Name matches are always kept: their similarity value only decides their
+    /// place in the sort.
+    fn score_candidate(
         &self,
-        candidates: &[CandidateMatch],
+        candidate: &CandidateMatch,
         decls1: &[DeclarationData],
         decls2: &[DeclarationData],
         source1: &str,
         source2: &str,
         scorer: Option<&RarityScorer>,
         calculate_similarity: &(impl Fn(&DeclarationData, &DeclarationData, &str, &str) -> f64 + Sync),
-    ) -> Vec<SimilarityResult> {
-        let progress = AtomicUsize::new(0);
-        let total = candidates.len();
-        let last_update = Mutex::new(Instant::now());
-        
-        let results = candidates.par_chunks(self.batch_size / 10) // Smaller batches for expensive calculations
-            .flat_map(|batch| {
-                let mut results = Vec::with_capacity(batch.len());
-                
-                for candidate in batch {
-                    let decl1 = &decls1[candidate.i1 as usize];
-                    let decl2 = &decls2[candidate.i2 as usize];
-                    
-                    let (similarity, evidence_count) =
-                        if self.use_fingerprints {
-                            if let (Some(ref fp1), Some(ref fp2), Some(s)) =
-                                (&decl1.fingerprint, &decl2.fingerprint, scorer) {
-                                let (fp_score, ev_count) = calculate_fingerprint_similarity(fp1, fp2, s);
+    ) -> Option<SimilarityResult> {
+        let decl1 = &decls1[candidate.i1 as usize];
+        let decl2 = &decls2[candidate.i2 as usize];
 
-                                // The structural term can only lower the combined score, so a
-                                // pair whose best case already misses the threshold cannot
-                                // survive and does not need its structural similarity computed.
-                                // The bound is written as the real expression with struct_sim
-                                // pinned at its maximum, so it is bit-identical to what the
-                                // pair would have scored, and this skips exactly the pairs the
-                                // threshold below would have rejected.
-                                //
-                                // Name matches are exempt: they are kept regardless of score,
-                                // and their similarity value decides their place in the sort.
-                                let best_case = fp_score * 0.7 + 1.0 * 0.3;
-                                if !candidate.name_match
-                                    && !should_match_with_score(best_case, ev_count, decl1.size)
-                                {
-                                    continue;
-                                }
+        let (similarity, evidence_count) =
+            if self.use_fingerprints {
+                if let (Some(ref fp1), Some(ref fp2), Some(s)) =
+                    (&decl1.fingerprint, &decl2.fingerprint, scorer) {
+                    let (fp_score, ev_count) = calculate_fingerprint_similarity(fp1, fp2, s);
 
-                                let struct_sim = calculate_similarity(decl1, decl2, source1, source2);
-                                (fp_score * 0.7 + struct_sim * 0.3, ev_count)
-                            } else {
-                                (calculate_similarity(decl1, decl2, source1, source2), 0)
-                            }
-                        } else {
-                            (calculate_similarity(decl1, decl2, source1, source2), 0)
-                        };
-
-                    // Apply thresholds - always include name matches
-                    if candidate.name_match || should_match_with_score(similarity, evidence_count, decl1.size) {
-                        results.push(SimilarityResult {
-                            i1: candidate.i1 as usize,
-                            i2: candidate.i2 as usize,
-                            similarity,
-                            evidence_count,
-                            name_match: candidate.name_match,
-                        });
+                    // The structural term can only lower the combined score, so a
+                    // pair whose best case already misses the threshold cannot
+                    // survive and does not need its structural similarity computed.
+                    // The bound is written as the real expression with struct_sim
+                    // pinned at its maximum, so it is bit-identical to what the
+                    // pair would have scored, and this skips exactly the pairs the
+                    // threshold below would have rejected.
+                    //
+                    // Name matches are exempt: they are kept regardless of score,
+                    // and their similarity value decides their place in the sort.
+                    let best_case = fp_score * 0.7 + 1.0 * 0.3;
+                    if !candidate.name_match
+                        && !should_match_with_score(best_case, ev_count, decl1.size)
+                    {
+                        return None;
                     }
+
+                    let struct_sim = calculate_similarity(decl1, decl2, source1, source2);
+                    (fp_score * 0.7 + struct_sim * 0.3, ev_count)
+                } else {
+                    (calculate_similarity(decl1, decl2, source1, source2), 0)
                 }
-                
-                // Report progress every second
-                let done = progress.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
-                
-                if let Ok(mut last) = last_update.try_lock() {
-                    if last.elapsed() >= Duration::from_secs(1) || done == total {
-                        eprint!("\r  Full similarity: {}/{} ({:.1}%)", done, total, done as f64 / total as f64 * 100.0);
-                        *last = Instant::now();
-                    }
-                }
-                
-                results
+            } else {
+                (calculate_similarity(decl1, decl2, source1, source2), 0)
+            };
+
+        // Apply thresholds - always include name matches
+        if candidate.name_match || should_match_with_score(similarity, evidence_count, decl1.size) {
+            Some(SimilarityResult {
+                i1: candidate.i1 as usize,
+                i2: candidate.i2 as usize,
+                similarity,
+                evidence_count,
+                name_match: candidate.name_match,
             })
-            .collect();
-            
-        // Clear the progress line with a final update
-        eprintln!("\r  Full similarity: {}/{} (100.0%) - Complete", total, total);
-        
-        results
+        } else {
+            None
+        }
     }
-    
+
     fn resolve_best_matches(
         &self,
         mut results: Vec<SimilarityResult>,
@@ -1503,5 +1476,104 @@ class store {
             "display diff shows the swapped default row:\n{}",
             change.display_diff
         );
+    }
+
+    /// Functions that share one shape and differ in their constants and in one
+    /// statement, so many cross pairs land in each other's size window and some
+    /// clear the LSH gate without being the same function.
+    fn similar_functions(prefix: &str, count: usize, edit_every: usize) -> String {
+        (0..count)
+            .map(|n| {
+                let extra = if n % edit_every == 0 { "  q.push(r);\n" } else { "" };
+                let tail = if n % 3 == 0 { "  return q.join(\",\");\n" } else { "  return q;\n" };
+
+                format!(
+                    "function {prefix}{n}(a, b) {{\n  var q = [], r = a + {n};\n  if (b > {k}) q.push(\"s{n}\");\n{extra}  for (var i = 0; i < b; i++) q.push(i * {n});\n{tail}}}\n",
+                    k = n % 7,
+                )
+            })
+            .collect()
+    }
+
+    type KeptPair = (usize, usize, u64, usize, bool);
+
+    fn kept_pair(result: &SimilarityResult) -> KeptPair {
+        (result.i1, result.i2, result.similarity.to_bits(), result.evidence_count, result.name_match)
+    }
+
+    fn structural_similarity(d1: &DeclarationData, d2: &DeclarationData, s1: &str, s2: &str) -> f64 {
+        StructuralDiff::new().calculate_declaration_similarity_data(d1, d2, s1, s2)
+    }
+
+    /// Every pair the scan should keep, found by testing all of them: the size
+    /// window, the kind, then a name match or the LSH gate, then the threshold.
+    fn all_pairs_reference(
+        matcher: &ParallelMatcherV2,
+        decls1: &[DeclarationData],
+        decls2: &[DeclarationData],
+        source1: &str,
+        source2: &str,
+    ) -> Vec<KeptPair> {
+        let mut kept = Vec::new();
+
+        for (i1, decl1) in decls1.iter().enumerate() {
+            let min_size = ((decl1.size as f64) * 0.5).max(1.0) as usize;
+            let max_size = ((decl1.size as f64) * 1.5) as usize;
+
+            for (i2, decl2) in decls2.iter().enumerate() {
+                let in_window = decl2.size >= min_size && decl2.size <= max_size;
+                let name_match = decl1.name == decl2.name;
+
+                if !in_window || decl1.kind != decl2.kind {
+                    continue;
+                }
+
+                if !name_match && !passes_lsh_gate(&decl1.minhash_signature, &decl2.minhash_signature) {
+                    continue;
+                }
+
+                let candidate = CandidateMatch { i1: i1 as u32, i2: i2 as u32, name_match };
+                let scored = matcher.score_candidate(
+                    &candidate, decls1, decls2, source1, source2, None, &structural_similarity,
+                );
+
+                if let Some(result) = scored {
+                    kept.push(kept_pair(&result));
+                }
+            }
+        }
+
+        kept
+    }
+
+    #[test]
+    fn the_single_pass_scan_keeps_exactly_the_pairs_a_full_comparison_keeps() {
+        let old = similar_functions("f", 40, 4);
+        let new = similar_functions("g", 40, 5);
+        let decls1 = declarations(&old);
+        let decls2 = declarations(&new);
+        let matcher = ParallelMatcherV2::new(false);
+
+        let scanned = matcher.scan_and_score(&decls1, &decls2, &old, &new, None, &structural_similarity);
+        let mut scanned_pairs: Vec<KeptPair> = scanned.iter().map(kept_pair).collect();
+        let mut expected = all_pairs_reference(&matcher, &decls1, &decls2, &old, &new);
+
+        // The fixture has to exercise cross pairs, or the comparison proves nothing.
+        assert!(
+            expected.len() > decls1.len(),
+            "fixture yields only {} kept pairs for {} declarations",
+            expected.len(),
+            decls1.len()
+        );
+
+        // resolve_best_matches tie-breaks on this order, so it is part of the contract.
+        assert!(
+            scanned.windows(2).all(|pair| pair[0].i1 <= pair[1].i1),
+            "results come out in i1 order"
+        );
+
+        scanned_pairs.sort();
+        expected.sort();
+        assert_eq!(scanned_pairs, expected);
     }
 }
